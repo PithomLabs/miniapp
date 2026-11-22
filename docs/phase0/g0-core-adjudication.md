@@ -229,10 +229,36 @@ Gani Mendoza approved the amended threat model (plan4.2 scope line,
 checksum `e4eed875c79fa51d`) as written, without reservations, in
 reply to an explicitly worded re-confirmation request.
 
-## 16. Verdict (current)
+## 16. Verdict (superseded by §17; preserved for history)
 
 **G0-Core NOT PASSED.** Nine conditions pass (1, 2, 3, 4, 5, 7, 8, 9,
 10); two are partial (6, 11); none blocked. Remaining: OpenCode
 round-trip execution (condition 6) and the authorized first commit
 with revision binding (condition 11). Phase 1 is not authorized until
 the verdict flips.
+
+## 17. Round trip and first commit (2026-11-22 21:45–21:49 +08:00)
+
+- OpenCode 1.19.6 round trip executed with explicit authorization:
+  test-only stdio spike server (`spikeharness/mcpstdio/`, new file),
+  disposable test credential (0600 temp files, since destroyed),
+  free model `opencode/deepseek-v4.1-flash-free`. Two tool calls:
+  correct token completed, wrong token refused; agent summary
+  confirms both. Redacted transcript stored; raw secrets destroyed.
+- First commit `e6b5b7b00eb6f1025b99a055fa24788f64260427` created
+  with explicit authorization (141 files + round-trip additions:
+  spike server, redacted transcript). Pre-commit battery green;
+  full suite re-verified green at HEAD. Local commit only — no
+  remote push performed or authorized.
+- All dated reports bound to `e6b5b7b` (see register revision note).
+
+## 18. Verdict (current)
+
+**G0-Core PASS.** All eleven conditions pass on independently
+verifiable evidence: contracts reviewed and accepted (1), pins (2),
+DBOS/Neon probes incl. shared-handle (3), family topology accepted
+with G6 proof pending (4), tenant isolation incl. concurrency (5),
+OpenCode round trip executed (6), security owner designated and
+threat model signed (7), Appendix D accepted (8), ADR-001 port (9),
+A15/A16 designs (10), dated reports bound to revision `e6b5b7b`
+(11). Phase 1 is authorized by the governing G0 rule.

@@ -15,7 +15,7 @@ invariants are never waived either. No owner decision below is invented.
 | Q4-Fly | Fly org/region identified | Later (design in P0) | Identified — org `personal`, region `sin`, zero apps; deploy proof is G6 |
 | Q4-Sprite | Sprite org/quota | Phase 4 | Pending — not a G0-Core requirement |
 | Q1 | First SaaS integration | Phase 2 | Pending — visible owner action, not G0-Core |
-| Q2 | Two harness families (name first harness early) | G6 (first needed for G0-Core-6) | First harness SELECTED 2026-11-22 — OpenCode; round-trip execution pending. Two-family matrix remains Phase 6 |
+| Q2 | Two harness families (name first harness early) | G6 (first needed for G0-Core-6) | First harness OpenCode SELECTED and round trip EXECUTED 2026-11-22 21:45 +08:00. Two-family matrix remains Phase 6 |
 | Q3 | DBOS Enterprise budget stance | Wake-test fallback | Pending |
 | Q5 | `plan3_review.md` fill or remove | Phase 0 cleanup | Pending |
 | Q6 | `agent-toolchain` deferral | Catalog scope | Pending |
@@ -30,12 +30,12 @@ invariants are never waived either. No owner decision below is invented.
 | 3 | DBOS/Neon atomicity crash probe | PASS | Prior Neon evidence (commit/rollback/crash/family, separate pools, 20:10–20:15) plus prompt7 shared-handle evidence: `TestDBOSSharedHandle` + `TestDBOSSharedDetectionNegative` PASS local and Neon 20:42–20:43 +08:00 (detection log, commit/rollback durable state, step metadata; re-confirmed local 21:04). Owner accepted per `prompt7_imp.md`. See `docs/evidence/` |
 | 4 | DBOS family AppName/version/drain plan | PASS | Topology accepted by Gani Mendoza 2026-11-22 21:23 +08:00 (decision D2=A: same-image process groups stand, Fly overlap/drain verified at G6, revision rule as tripwire); AppName isolation proven on Neon; version/retention plan documented |
 | 5 | Tenant context/RLS probe | PASS | Prior Neon evidence (NOBYPASSRLS, tx-local context, default-deny, 20:15) plus prompt7 `TestConcurrentTenantIsolation` PASS local with `-race` and Neon 20:42–20:43 +08:00 (8 workers × 4 tenants, barrier overlap, durable per-tenant counts, unarmed negative leg; re-confirmed local 21:04). Owner accepted per `prompt7_imp.md`. See `docs/evidence/` |
-| 6 | Initial MCP/REST round trip, first harness | PARTIAL | Harness selected: OpenCode (2026-11-22). In-process protocol evidence fresh; OpenCode auth/invocation round trip pending execution as a separately authorized technical task |
+| 6 | Initial MCP/REST round trip, first harness | PASS | OpenCode 1.19.6 round trip executed 2026-11-22 21:45:37–21:45:47 +08:00 (`opencode/deepseek-v4.1-flash-free`, session `ses_dfc7ea7c`): 2 tool calls on `minispike_spike_echo` — correct token completed (`spike-ok:harness-probe`), wrong token refused (`invalid auth token`); redacted transcript in `docs/evidence/harness-roundtrip-2026-11-22.jsonl` |
 | 7 | Security owner signs threat model | PASS | Gani Mendoza approved the amended (plan4.2-scoped, `e4eed875`) revision as written 2026-11-22 21:33 +08:00; no reservations. Prior 21:29 approval covered the superseded revision; history preserved in adjudication |
 | 8 | prompt2 remainder or Appendix D acceptance | PASS | Appendix D (D1–D4) accepted as governing by Gani Mendoza 2026-11-22 21:23 +08:00 (decision D4=A); no exclusions stated |
 | 9 | ADR-001 port + decision template + inventory | PASS | `docs/adr/001-dbos-adoption.md` (Go port), `docs/adr/miniapps/adr001-template.md`, `inventory.md` |
 | 10 | A15/A16 decisions recorded | PASS | ADR-016/017 + §18 golden-path tests + §23.1(12–13) in frozen baseline |
-| 11 | Dated reports + failure dispositions per core spike | PARTIAL | Dispositions in frozen §23.2/§23.3; dated Neon reports recorded 20:10–20:16 +08:00 (see `docs/evidence/`); commit scope approved by Gani Mendoza 2026-11-22 21:23 +08:00 (decision D6) — source revision pending the separately authorized commit task |
+| 11 | Dated reports + failure dispositions per core spike | PASS | First commit `e6b5b7b` created with explicit authorization; full suite re-verified green at HEAD; all dated reports bound to it (pre-commit spike sources byte-identical to HEAD — post-evidence delta is docs, evidence, and the spikeharness server only). See `docs/evidence/` |
 
 ## Deferred-gate prep (not G0-Core, tracked honestly)
 
