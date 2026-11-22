@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/deploy-profile",
+  "$ref": "#/$defs/DeployProfile",
+  "$defs": {
+    "DeployProfile": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "placement": {
+          "type": "string"
+        },
+        "sprite": {
+          "$ref": "#/$defs/SpritePolicy"
+        },
+        "promotion": {
+          "$ref": "#/$defs/PromotionPolicy"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "placement"
+      ]
+    },
+    "NetworkRule": {
+      "properties": {
+        "domain": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "include": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "action"
+      ]
+    },
+    "PromotionPolicy": {
+      "properties": {
+        "reviewRequired": {
+          "type": "boolean"
+        },
+        "requiredChecks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "reviewRequired"
+      ]
+    },
+    "ResourceLimits": {
+      "properties": {
+        "ramMb": {
+          "type": "integer"
+        },
+        "cpus": {
+          "type": "integer"
+        },
+        "storageGb": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SpritePolicy": {
+      "properties": {
+        "network": {
+          "items": {
+            "$ref": "#/$defs/NetworkRule"
+          },
+          "type": "array"
+        },
+        "resources": {
+          "$ref": "#/$defs/ResourceLimits"
+        },
+        "lifetime": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "network"
+      ]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# Optional host access for local development only.
+# Usage: docker compose -f compose.yaml -f compose.host.yaml up -d db
+# Binds loopback only; never 0.0.0.0. Default host port avoids the
+# conventional local 5432 to reduce clashes with other instances.
+services:
+  db:
+    ports:
+      - "127.0.0.1:${MINIAPP_DB_HOST_PORT:-5433}:5432"

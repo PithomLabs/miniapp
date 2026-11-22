@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/capability-spec",
+  "$ref": "#/$defs/CapabilitySpec",
+  "$defs": {
+    "AuditRequirement": {
+      "properties": {
+        "events": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retention": {
+          "type": "string"
+        },
+        "redact": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "CapabilitySpec": {
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "apiVersion": {
+          "type": "string"
+        },
+        "inputSchema": true,
+        "outputSchema": true,
+        "authMethod": {
+          "type": "string"
+        },
+        "connectionRef": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tenantScope": {
+          "type": "string"
+        },
+        "resourceScope": {
+          "type": "string"
+        },
+        "readOnly": {
+          "type": "boolean"
+        },
+        "risk": {
+          "type": "string"
+        },
+        "rateLimit": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "string"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        },
+        "idempotency": {
+          "$ref": "#/$defs/IdempotencyRequirement"
+        },
+        "errorContract": {
+          "type": "string"
+        },
+        "audit": {
+          "$ref": "#/$defs/AuditRequirement"
+        },
+        "fixtures": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "compensation": {
+          "type": "string"
+        },
+        "reconciliation": {
+          "type": "string"
+        },
+        "attribution": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "originApprovedBy": {
+          "type": "string"
+        },
+        "maxResponseBytes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "provider",
+        "operation",
+        "apiVersion",
+        "inputSchema",
+        "outputSchema",
+        "authMethod",
+        "connectionRef",
+        "risk"
+      ]
+    },
+    "IdempotencyRequirement": {
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "keyScope": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "required"
+      ]
+    },
+    "RetryPolicy": {
+      "properties": {
+        "maxAttempts": {
+          "type": "integer"
+        },
+        "backoff": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    }
+  }
+}

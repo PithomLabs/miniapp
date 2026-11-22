@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/run-handle",
+  "$ref": "#/$defs/RunHandle",
+  "$defs": {
+    "RunHandle": {
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "miniapp_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "poll_tool": {
+          "type": "string"
+        },
+        "signal_tool": {
+          "type": "string"
+        },
+        "cancel_tool": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run_id",
+        "miniapp_id",
+        "version",
+        "status",
+        "poll_tool",
+        "signal_tool",
+        "cancel_tool"
+      ]
+    }
+  }
+}

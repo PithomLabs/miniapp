@@ -1,0 +1,124 @@
+# Development operations for github.com/PithomLabs/miniapp.
+# Independent file: never imports Taskfile.prod.yml. Development only.
+# Usage: task --taskfile Taskfile.dev.yml --list
+version: '3'
+
+vars:
+  POSTGRES_IMAGE: '{{.POSTGRES_IMAGE | default "postgres:19.0"}}'
+  POSTGRES_MAJOR: '{{.POSTGRES_MAJOR | default "19"}}'
+  POSTGRES_USER: '{{.POSTGRES_USER | default "miniapp"}}'
+  POSTGRES_DB: '{{.POSTGRES_DB | default "miniapp_dev"}}'
+  DEV_APP: miniapp-demo
+  COMPOSE: docker compose -f compose.yaml
+
+tasks:
+  doctor:
+    desc: Check Docker, Compose, Go, Task, Fly CLI, and development configuration
+    cmds:
+      - task --version
+      - go version
+      - docker --version
+      - docker compose version
+      - flyctl version 2>/dev/null || echo "flyctl missing (remote dev unavailable)"
+      - bash scripts/dev/postgres-image.sh "{{.POSTGRES_IMAGE}}"
+      - test -f compose.yaml && echo "compose.yaml present"
+      - test -d "${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && echo "secrets dir present" || echo "secrets dir missing (run dev:db:up or local-secrets-init.sh)"
+
+  dev:db:pull:
+    desc: Pull the selected official PostgreSQL image (deliberate pull only)
+    cmds:
+      - bash scripts/dev/postgres-image.sh "{{.POSTGRES_IMAGE}}"
+      - docker pull "{{.POSTGRES_IMAGE}}"
+      - bash scripts/dev/postgres-image.sh "{{.POSTGRES_IMAGE}}"
+
+  dev:db:up:
+    desc: Start local PostgreSQL with safe volume handling (never deletes data)
+    cmds:
+      - bash scripts/dev/local-secrets-init.sh
+      - bash scripts/dev/postgres-image.sh "{{.POSTGRES_IMAGE}}"
+      - bash scripts/dev/postgres-volume-check.sh "{{.POSTGRES_MAJOR}}"
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && {{.COMPOSE}} up -d db
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && for i in $(seq 1 24); do {{.COMPOSE}} exec -T db pg_isready -U "{{.POSTGRES_USER}}" -d "{{.POSTGRES_DB}}" && break || sleep 5; done
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && {{.COMPOSE}} exec -T db pg_isready -U "{{.POSTGRES_USER}}" -d "{{.POSTGRES_DB}}"
+
+  dev:db:down:
+    desc: Stop local services without deleting database data
+    cmds:
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && {{.COMPOSE}} down
+
+  dev:db:logs:
+    desc: Show database logs with secret-safe diagnostics
+    cmds:
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && {{.COMPOSE}} logs --tail=200 db
+
+  dev:db:status:
+    desc: Show container and PostgreSQL health/version
+    cmds:
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && {{.COMPOSE}} ps db
+      - bash scripts/dev/postgres-image.sh "{{.POSTGRES_IMAGE}}"
+
+  dev:db:reset:
+    desc: Explicitly destructive local reset with confirmation (deletes current-major volume only)
+    prompt: Type RESET to delete the local miniapp-pgdata-{{.POSTGRES_MAJOR}} volume. This cannot be undone.
+    cmds:
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && {{.COMPOSE}} down
+      - docker volume rm "miniapp-pgdata-{{.POSTGRES_MAJOR}}"
+
+  dev:up:
+    desc: Start the normal local development stack
+    deps: [dev:db:up]
+    cmds:
+      - go build ./...
+      - echo "local stack up - PostgreSQL healthy; no app container exists yet (Phase 1)"
+
+  dev:down:
+    desc: Stop local development
+    deps: [dev:db:down]
+
+  test:
+    desc: Run local unit and contract tests
+    cmds:
+      - out=$(gofmt -l .); rc=$?; if [ $rc -ne 0 ]; then echo "gofmt execution failed"; exit $rc; fi; test -z "$out"
+      - go vet ./...
+      - go test ./...
+
+  test:integration:
+    desc: Run integration tests against local Docker PostgreSQL
+    cmds:
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && docker compose -f compose.yaml -f compose.host.yaml up -d db
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && for i in $(seq 1 24); do docker compose -f compose.yaml -f compose.host.yaml exec -T db pg_isready -U "{{.POSTGRES_USER}}" -d "{{.POSTGRES_DB}}" && break || sleep 5; done
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" && docker compose -f compose.yaml -f compose.host.yaml exec -T db pg_isready -U "{{.POSTGRES_USER}}" -d "{{.POSTGRES_DB}}"
+      - export MINIAPP_SECRETS_DIR="${MINIAPP_SECRETS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/miniapp}" DBPW="$(cat "$MINIAPP_SECRETS_DIR/db_password")" TEST_DATABASE_URL="postgres://{{.POSTGRES_USER}}:${DBPW}@127.0.0.1:${MINIAPP_DB_HOST_PORT:-5433}/{{.POSTGRES_DB}}" TEST_DBOS_DATABASE_URL="postgres://{{.POSTGRES_USER}}:${DBPW}@127.0.0.1:${MINIAPP_DB_HOST_PORT:-5433}/{{.POSTGRES_DB}}" && unset DBPW && go test ./spikes/ -timeout 10m
+
+  fly:status:
+    desc: Inspect miniapp-demo
+    cmds:
+      - bash scripts/fly/app-preflight.sh --app "{{.DEV_APP}}"
+      - flyctl status --app "{{.DEV_APP}}"
+
+  fly:secrets:list:
+    desc: Inspect development secret metadata (never values)
+    cmds:
+      - flyctl secrets list --app "{{.DEV_APP}}"
+
+  fly:secrets:stage:
+    desc: Interactively stage a development secret (SECRET=name required)
+    preconditions:
+      - sh: test -n "{{.SECRET}}"
+        msg: "SECRET=name is required (allowlisted: DATABASE_URL, DBOS_SYSTEM_DATABASE_URL)"
+    cmds:
+      - bash scripts/fly/secret-input.sh --env dev --app "{{.DEV_APP}}" --secret "{{.SECRET}}"
+
+  fly:secrets:apply:
+    desc: Apply staged development secrets
+    cmds:
+      - bash scripts/fly/secret-apply.sh --env dev --app "{{.DEV_APP}}"
+
+  fly:deploy:
+    desc: Deploy to the existing development Fly app
+    preconditions:
+      - sh: test -f fly.toml
+        msg: "no fly.toml exists yet (expected before Phase 1 deployment work)"
+    cmds:
+      - bash scripts/fly/app-preflight.sh --app "{{.DEV_APP}}"
+      - flyctl deploy --app "{{.DEV_APP}}"

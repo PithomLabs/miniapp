@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/caller",
+  "$ref": "#/$defs/Caller",
+  "$defs": {
+    "Authority": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "tenantId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "kind",
+        "id",
+        "tenantId"
+      ]
+    },
+    "Caller": {
+      "properties": {
+        "agentId": {
+          "type": "string"
+        },
+        "authority": {
+          "$ref": "#/$defs/Authority"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "agentId",
+        "authority"
+      ]
+    }
+  }
+}

@@ -1,0 +1,52 @@
+# Local development PostgreSQL for the miniapp project.
+#
+# Independent of Neon: local development must work with no remote
+# credentials. Secrets arrive only via file mounts; this file contains
+# no credential values. See docs/development/local-postgres.md.
+#
+# Required environment (exported by Taskfile.dev.yml tasks):
+#   POSTGRES_IMAGE       Official image tag (default postgres:19.0).
+#   POSTGRES_MAJOR       Major version matching the image (default 19).
+#   POSTGRES_USER        Role name (default miniapp).
+#   POSTGRES_DB          Database name (default miniapp_dev).
+#   MINIAPP_SECRETS_DIR  Owner-only host secret directory.
+name: miniapp-dev
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:19.0}
+    restart: unless-stopped
+    networks:
+      - miniapp-dev
+    volumes:
+      # Named volume is major-version isolated; see postgres-volume-check.sh.
+      # Mounted at the data parent so the image's own default PGDATA
+      # applies (verified: /var/lib/postgresql/19/docker for 19.0).
+      - pgdata:/var/lib/postgresql
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-miniapp}
+      POSTGRES_DB: ${POSTGRES_DB:-miniapp_dev}
+      # Password is injected by the image from this file only.
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-miniapp} -d ${POSTGRES_DB:-miniapp_dev}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    # No ports: the database is reachable only inside the Compose
+    # network by default. For host access use compose.host.yaml.
+
+networks:
+  miniapp-dev:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: miniapp-pgdata-${POSTGRES_MAJOR:-19}
+
+secrets:
+  db_password:
+    file: ${MINIAPP_SECRETS_DIR:?Set MINIAPP_SECRETS_DIR}/db_password

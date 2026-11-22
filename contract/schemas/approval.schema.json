@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/approval-record",
+  "$ref": "#/$defs/ApprovalRecord",
+  "$defs": {
+    "ApprovalRecord": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "miniappId": {
+          "type": "string"
+        },
+        "miniappVersion": {
+          "type": "string"
+        },
+        "invocationId": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "resource": {
+          "type": "string"
+        },
+        "intentHash": {
+          "type": "string"
+        },
+        "approver": {
+          "type": "string"
+        },
+        "authorityKind": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "decidedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "id",
+        "miniappId",
+        "miniappVersion",
+        "invocationId",
+        "operation",
+        "intentHash"
+      ]
+    }
+  }
+}

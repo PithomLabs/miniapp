@@ -1,0 +1,21 @@
+# Go
+*.exe
+*.test
+/bin/
+
+# Local environment and secrets (never commit values)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.miniapp-secrets/
+
+# Editor and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Task / Compose runtime state
+*.log

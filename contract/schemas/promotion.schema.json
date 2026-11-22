@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/promotion-record",
+  "$ref": "#/$defs/PromotionRecord",
+  "$defs": {
+    "PromotionRecord": {
+      "properties": {
+        "artifactDigest": {
+          "type": "string"
+        },
+        "manifestHash": {
+          "type": "string"
+        },
+        "dependencyLock": {
+          "type": "string"
+        },
+        "sbomRef": {
+          "type": "string"
+        },
+        "buildProvenance": {
+          "type": "string"
+        },
+        "sourceRevision": {
+          "type": "string"
+        },
+        "testResults": {
+          "type": "string"
+        },
+        "securityResults": {
+          "type": "string"
+        },
+        "profileDigests": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "decidedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "artifactDigest",
+        "manifestHash",
+        "dependencyLock",
+        "buildProvenance",
+        "sourceRevision",
+        "testResults",
+        "securityResults",
+        "profileDigests",
+        "reviewer",
+        "decision",
+        "target"
+      ]
+    }
+  }
+}

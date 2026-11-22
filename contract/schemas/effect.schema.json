@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/effect-record",
+  "$ref": "#/$defs/EffectRecord",
+  "$defs": {
+    "EffectRecord": {
+      "properties": {
+        "businessOpId": {
+          "type": "string"
+        },
+        "attemptId": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "capabilityId": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "providerRequestId": {
+          "type": "string"
+        },
+        "providerReplyRef": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "businessOpId",
+        "attemptId",
+        "capabilityId",
+        "operation",
+        "state"
+      ]
+    }
+  }
+}

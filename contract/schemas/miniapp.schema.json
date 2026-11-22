@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/miniapp-manifest",
+  "$ref": "#/$defs/MiniappManifest",
+  "$defs": {
+    "ApprovalRequirement": {
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "approverScope": {
+          "type": "string"
+        },
+        "selfApproval": {
+          "type": "boolean"
+        },
+        "expiry": {
+          "type": "string"
+        },
+        "thresholds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "required"
+      ]
+    },
+    "AuditRequirement": {
+      "properties": {
+        "events": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retention": {
+          "type": "string"
+        },
+        "redact": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "BlastRadiusLimits": {
+      "properties": {
+        "maxRunsPerHour": {
+          "type": "integer"
+        },
+        "maxRecordsPerRun": {
+          "type": "integer"
+        },
+        "maxAmount": {
+          "type": "string"
+        },
+        "recipientAllowlist": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "domainAllowlist": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "killSwitch": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "CapabilityRef": {
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "provider",
+        "operation",
+        "version"
+      ]
+    },
+    "DependencyManifest": {
+      "properties": {
+        "dbosSdk": {
+          "type": "string"
+        },
+        "river": {
+          "type": "string"
+        },
+        "mcpSdk": {
+          "type": "string"
+        },
+        "spriteSdk": {
+          "type": "string"
+        },
+        "capabilityRegistry": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "string"
+        },
+        "fixtures": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "DeploymentSection": {
+      "properties": {
+        "tools": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolDeployment"
+          },
+          "type": "object"
+        },
+        "promotion": {
+          "$ref": "#/$defs/PromotionPolicy"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "tools"
+      ]
+    },
+    "IdempotencyRequirement": {
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "keyScope": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "required"
+      ]
+    },
+    "MiniappManifest": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "examples": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolManifest"
+          },
+          "type": "array"
+        },
+        "deployment": {
+          "$ref": "#/$defs/DeploymentSection"
+        },
+        "dependencies": {
+          "$ref": "#/$defs/DependencyManifest"
+        },
+        "compatibility": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "id",
+        "version",
+        "description",
+        "tools",
+        "deployment"
+      ]
+    },
+    "ProfileRef": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "digest"
+      ]
+    },
+    "PromotionPolicy": {
+      "properties": {
+        "reviewRequired": {
+          "type": "boolean"
+        },
+        "requiredChecks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "reviewRequired"
+      ]
+    },
+    "RetryPolicy": {
+      "properties": {
+        "maxAttempts": {
+          "type": "integer"
+        },
+        "backoff": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SagaDeclaration": {
+      "properties": {
+        "compensations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "irreversible": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "ToolDeployment": {
+      "properties": {
+        "placement": {
+          "type": "string"
+        },
+        "profile": {
+          "$ref": "#/$defs/ProfileRef"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "placement",
+        "profile"
+      ]
+    },
+    "ToolManifest": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "class": {
+          "type": "string"
+        },
+        "substrate": {
+          "type": "string"
+        },
+        "inputSchema": true,
+        "outputSchema": true,
+        "capabilities": {
+          "items": {
+            "$ref": "#/$defs/CapabilityRef"
+          },
+          "type": "array"
+        },
+        "trustModes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "approval": {
+          "$ref": "#/$defs/ApprovalRequirement"
+        },
+        "idempotency": {
+          "$ref": "#/$defs/IdempotencyRequirement"
+        },
+        "timeout": {
+          "type": "string"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        },
+        "cancellable": {
+          "type": "boolean"
+        },
+        "effects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "saga": {
+          "$ref": "#/$defs/SagaDeclaration"
+        },
+        "audit": {
+          "$ref": "#/$defs/AuditRequirement"
+        },
+        "fixtures": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "examples": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "entityKey": {
+          "type": "string"
+        },
+        "noEntityReason": {
+          "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/BlastRadiusLimits"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "class",
+        "substrate",
+        "inputSchema",
+        "outputSchema"
+      ]
+    }
+  }
+}

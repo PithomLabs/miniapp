@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/release-envelope",
+  "$ref": "#/$defs/ReleaseEnvelope",
+  "$defs": {
+    "ReleaseEnvelope": {
+      "properties": {
+        "manifest": {
+          "type": "string"
+        },
+        "implementation": {
+          "type": "string"
+        },
+        "build": {
+          "type": "string"
+        },
+        "sourceRevision": {
+          "type": "string"
+        },
+        "artifact": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "manifest",
+        "implementation",
+        "build",
+        "sourceRevision",
+        "artifact"
+      ]
+    }
+  }
+}

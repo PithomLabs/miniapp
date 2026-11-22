@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/task-record",
+  "$ref": "#/$defs/TaskRecord",
+  "$defs": {
+    "TaskRecord": {
+      "properties": {
+        "taskId": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": "string"
+        },
+        "workflowId": {
+          "type": "string"
+        },
+        "spriteId": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "policyDigest": {
+          "type": "string"
+        },
+        "leaseExpiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "fencingToken": {
+          "type": "string"
+        },
+        "resultRef": {
+          "type": "string"
+        },
+        "cleanup": {
+          "type": "string"
+        },
+        "lastError": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "taskId",
+        "parentRunId",
+        "state",
+        "cleanup"
+      ]
+    }
+  }
+}

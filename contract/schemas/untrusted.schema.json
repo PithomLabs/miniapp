@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PithomLabs/miniapp/contract/untrusted-text",
+  "$ref": "#/$defs/UntrustedText",
+  "$defs": {
+    "UntrustedText": {
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "untrusted": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "value",
+        "untrusted"
+      ]
+    }
+  }
+}

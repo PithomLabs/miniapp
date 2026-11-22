@@ -1,0 +1,41 @@
+{
+  "id": "rpa.crm.read_contact",
+  "version": "1.0.0",
+  "description": "Read a contact by ID with tenant isolation.",
+  "tools": [
+    {
+      "name": "rpa.crm.read_contact",
+      "description": "Read one contact.",
+      "class": "A",
+      "substrate": "go",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"contactId": {"type": "string"}},
+        "required": ["contactId"]
+      },
+      "outputSchema": {"type": "object"},
+      "capabilities": [
+        {"provider": "crm", "operation": "get_contact", "version": "1.0.0"}
+      ],
+      "trustModes": ["dry-run", "confirm", "autonomous"],
+      "idempotency": {"required": false},
+      "cancellable": false,
+      "fixtures": ["read_contact_basic"]
+    }
+  ],
+  "deployment": {
+    "tools": {
+      "rpa.crm.read_contact": {
+        "placement": "machine",
+        "profile": {
+          "name": "prod-machine",
+          "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    },
+    "promotion": {"reviewRequired": true}
+  },
+  "dependencies": {
+    "fixtures": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}

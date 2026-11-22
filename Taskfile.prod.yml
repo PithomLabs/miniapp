@@ -1,0 +1,91 @@
+# Production operations for github.com/PithomLabs/miniapp.
+# Independent file: never imports Taskfile.dev.yml, starts no local
+# PostgreSQL, and exposes no development tasks.
+# Usage: task --taskfile Taskfile.prod.yml --list
+#
+# Required non-secret configuration (environment, never values in repo):
+#   MINIAPP_PROD_APP   Explicit production Fly application name.
+#   MINIAPP_PROD_ORG   Expected production Fly organization.
+version: '3'
+
+tasks:
+  doctor:
+    desc: Verify Fly CLI, configured production app, organization, and preconditions
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured; production target unknown"
+      - sh: test -n "${MINIAPP_PROD_ORG:-}"
+        msg: "MINIAPP_PROD_ORG is not configured; production org unknown"
+    cmds:
+      - flyctl version
+      - flyctl auth whoami
+      - bash scripts/fly/app-preflight.sh --app "${MINIAPP_PROD_APP}" --org "${MINIAPP_PROD_ORG}"
+      - git rev-parse --verify HEAD 2>/dev/null || echo "no git revision (uncommitted tree)"
+
+  fly:status:
+    desc: Inspect the production application
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+    cmds:
+      - bash scripts/fly/app-preflight.sh --app "${MINIAPP_PROD_APP}" --org "${MINIAPP_PROD_ORG:-}"
+      - flyctl status --app "${MINIAPP_PROD_APP}"
+
+  secrets:list:
+    desc: List production secret metadata (never values)
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+    cmds:
+      - flyctl secrets list --app "${MINIAPP_PROD_APP}"
+
+  secrets:stage:
+    desc: Interactively stage an approved production secret (SECRET=name required)
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+      - sh: test -n "{{.SECRET}}"
+        msg: "SECRET=name is required (allowlisted: DATABASE_URL, DBOS_SYSTEM_DATABASE_URL)"
+    cmds:
+      - bash scripts/fly/secret-input.sh --env prod --app "${MINIAPP_PROD_APP}" --secret "{{.SECRET}}"
+
+  secrets:apply:
+    desc: Apply production secrets after explicit confirmation
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+    cmds:
+      - bash scripts/fly/secret-apply.sh --env prod --app "${MINIAPP_PROD_APP}"
+
+  deploy:
+    desc: Deploy production after all required checks and owner confirmation
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+      - sh: test -n "${MINIAPP_PROD_ORG:-}"
+        msg: "MINIAPP_PROD_ORG is not configured"
+      - sh: test -f fly.toml
+        msg: "no fly.toml exists yet (expected before Phase 1 deployment work)"
+    cmds:
+      - bash scripts/fly/app-preflight.sh --app "${MINIAPP_PROD_APP}" --org "${MINIAPP_PROD_ORG}"
+      - git rev-parse --verify HEAD
+      - bash scripts/fly/release-verify.sh --app "${MINIAPP_PROD_APP}"
+      - "printf 'Type the production application name to deploy: ' && IFS= read -r confirm && test \"$confirm\" = \"${MINIAPP_PROD_APP}\""
+      - flyctl deploy --app "${MINIAPP_PROD_APP}"
+
+  release:verify:
+    desc: Verify deployed release identity and health
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+    cmds:
+      - bash scripts/fly/release-verify.sh --app "${MINIAPP_PROD_APP}" --expect-deployed
+
+  rollback:prepare:
+    desc: Inspect and prepare rollback; never executes destructive action silently
+    preconditions:
+      - sh: test -n "${MINIAPP_PROD_APP:-}"
+        msg: "MINIAPP_PROD_APP is not configured"
+    cmds:
+      - bash scripts/fly/release-verify.sh --app "${MINIAPP_PROD_APP}"
+      - echo "Rollback runs only as an explicit owner-approved flyctl deploy of a prior digest (see docs/operations/fly-production.md)."
