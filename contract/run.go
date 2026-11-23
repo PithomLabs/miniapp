@@ -39,6 +39,18 @@ type Signal struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
+// SignalApprovalDecided is the framework topic notifying a waiting
+// workflow that its approval resolved. The signal is a notification
+// only: workflows re-read the authoritative approvals table on wake
+// (or timeout), so duplicate or redelivered signals are harmless.
+const SignalApprovalDecided = "approval.decided"
+
+// ApprovalSignal is the payload of a SignalApprovalDecided signal.
+type ApprovalSignal struct {
+	ApprovalID string           `json:"approvalId"`
+	Decision   ApprovalDecision `json:"decision"`
+}
+
 // UntrustedText wraps provider-originated free text. The flag is always
 // true by construction: provider content is data for the agent to
 // interpret, never instructions and never trusted error prose.

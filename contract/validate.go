@@ -57,6 +57,28 @@ func (d Digest) Validate(field string) error {
 	return nil
 }
 
+// EntityKey declares how the framework derives a tool's serialization
+// entity at dispatch: a dot-separated input field path whose string
+// value is the tenant-local entity ID. The framework scopes the
+// invoking tenant via contract.ScopeID (percent-escaping both parts
+// before joining), so manifests never embed a tenant and distinct
+// (tenant, local) pairs cannot collide even when either part
+// contains the separator. An empty key means the tool declares no
+// entity scope (allowed only with a reviewed NoEntityWhy
+// justification on the manifest).
+type EntityKey string
+
+// Validate reports whether k is a well-formed entity-key path.
+func (k EntityKey) Validate(field string) error {
+	if len(k) == 0 || len(k) > MaxNameLen {
+		return Terminal(field, "must be 1-%d characters", MaxNameLen)
+	}
+	if !nameRe.MatchString(string(k)) {
+		return Terminal(field, "must be a lowercase input field path, e.g. lead_id")
+	}
+	return nil
+}
+
 // ToolName is a validated dotted tool name.
 type ToolName string
 

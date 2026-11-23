@@ -13,6 +13,7 @@ No `latest` anywhere. Re-verify on any upgrade.
 | Sprite operations | `github.com/superfly/sprites-go` v0.2.2 | MIT | 1.26 | Security owner (Q9) | Proxy zip matches inspected checkout (nested example/test-cli modules excluded; published go.mod pins client-signals v0.4.4 vs checkout v0.5.0 — no API impact); Appendix C re-verified at pin |
 | Postgres driver | `github.com/jackc/pgx/v5` v5.13.0 | MIT | 1.25 | Security owner (Q9) | Satisfies DBOS (5.13.0) and River (5.11.0) floors |
 | Schema generation | `github.com/invopop/jsonschema` v0.14.0 | MIT-style (COPYING) | 1.24 | Security owner (Q9) | `Reflector.Reflect` drives `contract.GenerateSchemas` + drift test |
+| Schema validation | `github.com/santhosh-tekuri/jsonschema/v6` v6.0.3 | Apache-2.0 | 1.21 | Security owner (Q9) | Added Phase 1 (2026-11-22) for runtime input validation; `Compiler.Compile` API verified in module source |
 | Migrations (tool) | `github.com/golang-migrate/migrate/v4` v4.20.1 | MIT | 1.25 | Security owner (Q9) | Pinned as CI tool (`go run .../cmd/migrate@...`); not imported |
 | Key management | TBD — selected in Phase 2 with the vault decision | Verify then | — | Security owner (Q9) | A10/K10; envelope + KMS recommended, not yet chosen |
 

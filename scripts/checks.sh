@@ -33,14 +33,30 @@ if grep -rn "dbos-transact-golang/enterprise\|/conductor" --include="*.go" contr
   bad "enterprise DBOS import detected (needs owner approval)"
 fi
 
-# 4. Framework never imports reference miniapps.
-if grep -rn "PithomLabs/miniapp/miniapps" --include="*.go" contract deploy internal registry runtime executor capability auth tokens effects approvals audit transport testkit 2>/dev/null; then
+# 4. Framework production code never imports reference miniapps
+# (test wiring may, to exercise the runtime against a real miniapp).
+if grep -rn "PithomLabs/miniapp/miniapps" --include="*.go" contract deploy internal registry runtime executor capability auth tokens effects approvals audit transport testkit 2>/dev/null | grep -v "_test.go"; then
   bad "framework package imports miniapps/"
 fi
 
 # 5. No provider credentials in test fixtures or schemas.
 if grep -rniE "password|secret|bearer|api[_-]?key" --include="*.json" contract/schemas contract/testdata 2>/dev/null | grep -viE "password authentication|secret boundary"; then
   bad "possible credential in fixtures/schemas"
+fi
+
+# 6. Determinism analyzer strict over Class D code (seven rule
+# families; any finding fails the build before a Class D release).
+lint_out=$(go run ./cmd/determinism-lint ./... 2>&1); lint_rc=$?
+if [ "$lint_rc" -ne 0 ]; then
+  bad "determinism analyzer found violations: $lint_out"
+fi
+
+# 7. Architectural-contract preflight: miniapps against ADR-001
+# records and the evidence register. Fails on missing, stale, or
+# unapproved decision state; warnings never fail.
+preflight_out=$(go run ./cmd/preflight --check-all 2>&1); preflight_rc=$?
+if [ "$preflight_rc" -ne 0 ]; then
+  bad "architectural preflight failed: $preflight_out"
 fi
 
 if [ "$fail" -eq 0 ]; then

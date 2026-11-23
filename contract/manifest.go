@@ -1,6 +1,9 @@
 package contract
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Class is the Dimension A execution class of a tool.
 type Class string
@@ -132,7 +135,7 @@ type ToolManifest struct {
 	Audit        AuditRequirement       `json:"audit,omitempty"`
 	Fixtures     []string               `json:"fixtures,omitempty"`
 	Examples     []string               `json:"examples,omitempty"`
-	EntityKey    string                 `json:"entityKey,omitempty"`
+	EntityKey    EntityKey              `json:"entityKey,omitempty"`
 	NoEntityWhy  string                 `json:"noEntityReason,omitempty"`
 	Limits       BlastRadiusLimits      `json:"limits,omitempty"`
 }
@@ -190,6 +193,16 @@ func (t ToolManifest) validate(field string) *MultiError {
 	// lands with registry admission in Phase 1.
 	if len(t.Effects) > 0 && t.EntityKey == "" && t.NoEntityWhy == "" {
 		m.Add(Terminal(field, "tools with effects must declare entityKey or noEntityReason"))
+	}
+	if t.EntityKey != "" {
+		if err := t.EntityKey.Validate(field + ".entityKey"); err != nil {
+			m.Add(err.(*Error))
+		}
+	}
+	if t.Approval.Expiry != "" {
+		if _, err := time.ParseDuration(t.Approval.Expiry); err != nil {
+			m.Add(Terminal(field+".approval.expiry", "must be a Go duration string, e.g. 24h"))
+		}
 	}
 	sub := t.Limits.validate(field + ".limits")
 	m.Errs = append(m.Errs, sub.Errs...)

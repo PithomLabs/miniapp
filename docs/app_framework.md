@@ -1754,3 +1754,130 @@ All reads and edits are Class A. CSV exports are B. Bulk updates are C. There is
 - Expose async work through **one `runs` resource**, and make every write **idempotent**.
 - Keep **domain rules pure** and the shell thin, so a use case can move between categories without a rewrite.
 - Adopt the framework **in levels**; stop when the next level stops paying for itself.
+
+## prompt
+
+just to clarify, one of the goals of this miniapp framework is to create robust primitives so that any miniapp implementation do not need to reinvent the wheel in order to create robust apps across the 4 app categories especially class D
+
+## Answer
+
+That is an important architectural clarification. In fact, I would make it an explicit, central objective of the Miniapp framework—not merely an implied benefit.
+
+**The framework is not simply a runtime for executing miniapps. It is a platform that provides the reusable engineering primitives necessary to build robust business applications without requiring every miniapp developer to become an expert in distributed systems, transaction management, workflow orchestration, and failure recovery.**
+
+That distinction changes how we should evaluate Prompt 15.2.
+
+## **1. The framework owns reliability; miniapps own business logic**
+
+The fundamental division should be:
+
+| Responsibility                   | Framework                         | Miniapp                                                     |
+| -------------------------------- | --------------------------------- | ----------------------------------------------------------- |
+| Authentication and authorization | Provides and enforces             | Declares requirements                                       |
+| Tenant isolation                 | Enforces                          | Uses trusted context                                        |
+| Invocation and idempotency       | Manages                           | Defines business input                                      |
+| Execution lifecycle              | Manages                           | Defines business operation                                  |
+| Retry and recovery               | Provides safe mechanisms          | Defines business-specific retry policy where necessary      |
+| Audit                            | Provides durable attribution      | Supplies business context                                   |
+| Effects and approvals            | Provides secure primitives        | Declares consequential operations and approval requirements |
+| Durable waits and signals        | Provides orchestration primitives | Defines when and why to wait                                |
+| Cancellation                     | Enforces lifecycle guarantees     | Defines business cancellation behavior                      |
+| Version compatibility            | Provides recovery mechanisms      | Declares compatibility requirements                         |
+| Business rules                   | Does not invent them              | Owns them                                                   |
+
+The miniapp developer should be able to concentrate on the actual problem being solved rather than repeatedly implementing infrastructure that every other miniapp also needs.
+
+## **2. What this means across the four execution classes**
+
+**Class A — Synchronous operation**
+
+Framework-managed reliability
+
+The developer implements the business operation. The framework handles invocation, authentication, tenant context, transaction boundaries, serialization where required, and audit.
+
+**Class B — One-shot independently retryable job**
+
+Framework-managed reliability
+
+The developer defines the job. The framework provides durable enqueueing, identity, retries, idempotency, and observable outcomes.
+
+**Class C — Bounded batch or multistep execution**
+
+Framework-managed reliability
+
+The developer defines the batch or bounded sequence. The framework provides execution controls, progress, concurrency limits, recovery, and the appropriate execution substrate.
+
+**Class D — Durable business workflow**
+
+Highest primitive-reuse priority
+
+The developer defines the business process. The framework provides durable orchestration, checkpointing, waits, signals, approval integration, effect safety, cancellation, version compatibility, recovery, and lifecycle observability.
+
+Class D is particularly important because its failure modes are substantially more complicated. Without framework-provided primitives, every miniapp author would have to rediscover the same distributed-systems problems.
+
+## **3. The real meaning of Prompt 15 remediation**
+
+This is where your clarification materially changes the acceptance criteria.
+
+Take the five HIGH findings:
+
+- X-01 and X-02 should not merely be fixed in the current approval implementation. The framework should expose an approval primitive that makes bypass and stranded approval workflows structurally difficult or impossible.
+- X-03 should result in reusable invocation and workflow identity management, not a special-case locking fix for one miniapp.
+- X-04 should result in a reusable, concurrency-safe approval decision mechanism.
+- X-05 should result in an effect-reservation primitive that automatically coordinates with framework cancellation.
+
+The same principle applies to the MEDIUM findings.
+
+For example, a future Class D miniapp should not have to implement its own signal recovery loop, settlement audit, effect refusal audit, or workflow attachment mechanism.
+
+**Fixing the framework means making the safe implementation the easiest and preferably the only supported implementation.**
+
+## **4. An additional architectural acceptance criterion**
+
+I recommend adding this objective explicitly to Prompt 15.2 and the P1 design document:
+
+> **Reusable Framework Primitives and Miniapp Authoring Contract**
+>
+> The Miniapp framework must provide reusable, composable, and safe primitives across execution Classes A, B, C, and D. Miniapp implementations must not independently reinvent framework-level concerns such as invocation identity, idempotency, authorization, tenant isolation, lifecycle transitions, retry and recovery, audit, cancellation, or durable orchestration.
+>
+> Each primitive must have a documented contract, clearly defined responsibilities, safe default behavior, explicit failure semantics, and conformance tests.
+>
+> For Class D in particular, a miniapp author must be able to express its business workflow using framework-supported capabilities without independently implementing DBOS lifecycle management, approval recovery, signal delivery recovery, effect reservation, cancellation coordination, or settlement auditing.
+>
+> Framework internals may use DBOS, River, PostgreSQL, or other appropriate mechanisms, but miniapp authors should interact with the framework's stable abstractions rather than being required to reproduce or directly manage those underlying mechanisms.
+>
+> The framework must prove primitive reuse through multiple distinct test miniapps or conformance fixtures using the same framework capabilities, without duplicating lifecycle machinery.
+>
+> The framework remains responsible for technical guarantees; miniapps remain responsible for business rules and business-specific decisions.
+
+## **5. One important distinction**
+
+We should not attempt to turn every business behavior into a generic framework primitive.
+
+For instance:
+
+- The framework provides approval mechanics; the miniapp defines *what* needs approval.
+- The framework provides durable waits; the miniapp defines *when* business conditions warrant waiting.
+- The framework provides effect safety; the miniapp defines *what* consequential business operation to perform.
+- The framework provides cancellation guarantees; the miniapp defines whether the underlying business process permits cancellation at a particular stage.
+
+That separation prevents the framework from becoming an enormous, inflexible business-process engine.
+
+## **My architectural conclusion**
+
+The ultimate measure of Miniapp's success should be:
+
+**How little infrastructure code must an application developer write to produce a reliable application?**
+
+For Class D, a developer should be able to implement a sophisticated, multistage business workflow without personally solving workflow durability, approval races, effect idempotency, cancellation races, or recovery after process failure.
+
+That is a much stronger objective than merely passing the current Class D conformance tests.
+
+It also means Prompt 15 should leave behind two things:
+
+1. A corrected framework with reusable reliability primitives.
+2. A clear, stable miniapp authoring contract that makes those primitives accessible and difficult to misuse.
+
+The neutral probe proves that the primitives work. Multiple distinct conformance fixtures should prove that they are genuinely reusable.
+
+**We are building the foundation that makes robust miniapps ordinary to write, not building another framework that requires every developer to become its reliability engineer.**

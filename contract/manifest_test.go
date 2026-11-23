@@ -139,6 +139,24 @@ func TestEffectToolRequiresEntityKeyOrJustification(t *testing.T) {
 	}
 }
 
+func TestEntityKeyFormat(t *testing.T) {
+	for _, good := range []string{"lead_id", "contact_id", "lead.contact_id"} {
+		if err := EntityKey(good).Validate("entityKey"); err != nil {
+			t.Fatalf("%q rejected: %v", good, err)
+		}
+	}
+	for _, bad := range []string{"Lead_ID", "a:b", "a..b", ".a", "a.", "a b", strings.Repeat("a", MaxNameLen+1)} {
+		if err := EntityKey(bad).Validate("entityKey"); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+	}
+	mf := loadValidManifest(t)
+	mf.Tools[0].EntityKey = "Has-Uppercase"
+	if err := mf.Validate(); err == nil {
+		t.Fatal("manifest with malformed entityKey accepted")
+	}
+}
+
 func TestNegativeLimitsRejected(t *testing.T) {
 	mf := loadValidManifest(t)
 	mf.Tools[0].Limits.MaxRecordsPerRun = -1
@@ -187,5 +205,17 @@ func TestCallerValidation(t *testing.T) {
 	bad.Authority.TenantID = ""
 	if err := bad.Validate(); err == nil {
 		t.Fatal("caller without tenant accepted")
+	}
+}
+
+func TestApprovalExpiryFormat(t *testing.T) {
+	mf := loadValidManifest(t)
+	mf.Tools[0].Approval = ApprovalRequirement{Required: true, Expiry: "24h"}
+	if err := mf.Validate(); err != nil {
+		t.Fatalf("duration expiry rejected: %v", err)
+	}
+	mf.Tools[0].Approval.Expiry = "tomorrow"
+	if err := mf.Validate(); err == nil {
+		t.Fatal("non-duration expiry accepted")
 	}
 }

@@ -40,6 +40,15 @@ func (c PoolConfig) String() string {
 // explicit transaction; in autocommit each statement is its own
 // transaction and the setting is discarded immediately. Prefer
 // WithTenant, the only approved entry point for tenant transactions.
+// LockEntity serializes the current transaction on a tenant-scoped
+// entity key. The lock is transaction-scoped (released at commit or
+// rollback), so it is safe for single-transaction Class A execution
+// and can never be held across a durable wait.
+func LockEntity(ctx context.Context, tx pgx.Tx, entityKey string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, entityKey)
+	return err
+}
+
 func TenantContextSQL() string {
 	return `SELECT set_config('app.tenant_id', $1, true)`
 }
