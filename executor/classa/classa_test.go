@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/PithomLabs/miniapp/contract"
 	"github.com/PithomLabs/miniapp/executor"
 	"github.com/PithomLabs/miniapp/executor/classa"
@@ -35,6 +37,19 @@ func req(entity, inv string) executor.Request {
 			Authority: contract.Authority{Kind: contract.AuthorityUser, ID: "agent-a", TenantID: "tenant-a"}},
 		MiniappID: probeID, Version: "1.0.0", Tool: tool,
 		Input: json.RawMessage(`{"subject_id":"x"}`), EntityKey: entity,
+		Claim: stubClaim(),
+	}
+}
+
+// stubClaim stands in for the runtime's invocation hooks: the
+// entity-serialization tests below exercise lock orchestration,
+// not invocation lifecycle (covered at the runtime level).
+func stubClaim() *executor.ClaimHooks {
+	return &executor.ClaimHooks{
+		Recheck: func(tx pgx.Tx) (bool, error) { return true, nil },
+		Complete: func(tx pgx.Tx, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
+			return true, nil
+		},
 	}
 }
 

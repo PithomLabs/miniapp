@@ -171,7 +171,7 @@ func (s *Service) Invoke(ctx context.Context, req InvokeRequest) (InvokeResult, 
 		return InvokeResult{}, retryable("store-unavailable", "%v", err)
 	}
 	if !created {
-		return s.replay(ctx, req, binding, tool, rec)
+		return s.replay(ctx, req, binding, tool, rec, true)
 	}
 	// claim-response models a lost success response after the claim
 	// commit: the row stands, the caller retries, and the retry
@@ -189,9 +189,14 @@ func (s *Service) Invoke(ctx context.Context, req InvokeRequest) (InvokeResult, 
 // replay answers a repeated idempotency key from the record without
 // re-executing. Terminal outcomes replay verbatim; live Class D runs
 // return their handle; interrupted Class A attempts fail closed with
-// instructions to resubmit under a new key.
-func (s *Service) replay(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation) (InvokeResult, error) {
-	s.auditBestEffort(ctx, req, binding, "invoke", "duplicate", rec.ID)
+// instructions to resubmit under a new key. The duplicate marker is
+// emitted only when the claim actually identified an existing
+// invocation (isDuplicate): lost-race reloads answer from the
+// record without mislabeling a first-claim caller as a duplicate.
+func (s *Service) replay(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation, isDuplicate bool) (InvokeResult, error) {
+	if isDuplicate {
+		s.auditBestEffort(ctx, req, binding, "invoke", "duplicate", rec.ID)
+	}
 	switch rec.Status {
 	case contract.RunSucceeded:
 		out := InvokeResult{InvocationID: rec.ID, Status: rec.Status, Result: rec.Result}
@@ -448,7 +453,7 @@ func (s *Service) settlePollTerminal(ctx context.Context, req InvokeRequest, bin
 		if err != nil {
 			return InvokeResult{}, retryable("store-unavailable", "%v", err)
 		}
-		return s.replay(ctx, req, binding, tool, fresh)
+		return s.replay(ctx, req, binding, tool, fresh, false)
 	}
 	switch outcome {
 	case "denied":
@@ -536,6 +541,19 @@ var errApprovalRequired = errors.New("runtime: approval linkage required before 
 //
 // Record status is never changed here: callers submit only from
 // states whose status is already correct.
+// adoptEligible mirrors the adoptRunID live-state predicate: only
+// these statuses may gain a workflow binding (winners) or lend one
+// to a loser (adoption). Terminal and quarantined records are
+// ineligible in both directions.
+func adoptEligible(s contract.RunStatus) bool {
+	switch s {
+	case contract.RunPending, contract.RunRunning, contract.RunWaitingEvent, contract.RunWaitingApproval:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) submitChecked(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation) (contract.RunHandle, error) {
 	tenantID := binding.Authority.TenantID
 	cur, err := s.store.getByID(ctx, tenantID, rec.ID)
@@ -567,6 +585,14 @@ func (s *Service) submitChecked(ctx context.Context, req InvokeRequest, binding 
 		req.approvalID = appr.ID
 	}
 	runID := cur.RunID
+	if runID != "" && !adoptEligible(cur.Status) {
+		// Already bound, but the reloaded record is no longer
+		// eligible (a concurrent settlement landed after the
+		// caller read it live): the bound run must not be
+		// submitted. Same convergence as below via replay.
+		return contract.RunHandle{}, retryable("run-adoption-ineligible",
+			"invocation %s is %s; no workflow submitted", cur.ID, cur.Status)
+	}
 	if runID == "" {
 		if err := s.TestFault.Fire("runid-persist"); err != nil {
 			return contract.RunHandle{}, retryable("store-unavailable", "%v", err)
@@ -580,6 +606,15 @@ func (s *Service) submitChecked(ctx context.Context, req InvokeRequest, binding 
 			winner, err := s.store.getByID(ctx, tenantID, cur.ID)
 			if err != nil || winner.RunID == "" {
 				return contract.RunHandle{}, retryable("store-unavailable", "run adoption lost with no winner")
+			}
+			// The winner may have settled terminally after this
+			// request read it live: never submit a workflow for
+			// an ineligible invocation. The caller retries the
+			// same key and converges via replay on the recorded
+			// terminal.
+			if !adoptEligible(winner.Status) {
+				return contract.RunHandle{}, retryable("run-adoption-ineligible",
+					"invocation %s is %s; no workflow submitted", cur.ID, winner.Status)
 			}
 			runID = winner.RunID
 		} else {
@@ -636,39 +671,47 @@ func (s *Service) toolFor(req InvokeRequest) (contract.ToolManifest, error) {
 }
 
 func (s *Service) executeSync(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation) (InvokeResult, error) {
-	result, err := s.cfg.Sync.Execute(ctx, s.executorRequest(req, binding, rec, ""))
-	if err != nil {
-		return s.completeSync(ctx, req, binding, tool, rec, contract.RunFailed, nil, err.Error())
-	}
-	return s.completeSync(ctx, req, binding, tool, rec, contract.RunSucceeded, result, "")
-}
-
-// completeSync records a synchronous completion from a live state
-// only. On losing the transition race (notably to a concurrent
-// Cancel) it reloads and replays on fresh state: the handler
-// result is discarded rather than overwriting cancellation, and
-// the caller learns the recorded terminal.
-func (s *Service) completeSync(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation, status contract.RunStatus, result json.RawMessage, errMsg string) (InvokeResult, error) {
 	tenantID := binding.Authority.TenantID
-	won, err := s.store.completeIfLive(ctx, tenantID, rec.ID, status, result, errMsg)
-	if err != nil {
-		return InvokeResult{}, retryable("store-unavailable", "%v", err)
+	ereq := s.executorRequest(req, binding, rec, "")
+	// The production Class A path always carries claim hooks
+	// (mandatory; the executor fails closed without them).
+	ereq.Claim = &executor.ClaimHooks{
+		Recheck: func(tx pgx.Tx) (bool, error) {
+			return s.store.recheckTx(ctx, tx, tenantID, rec.ID)
+		},
+		Complete: func(tx pgx.Tx, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
+			return s.store.completeTx(ctx, tx, tenantID, rec.ID, status, result, errMsg)
+		},
 	}
-	if !won {
+	result, err := s.cfg.Sync.Execute(ctx, ereq)
+	if err == nil {
+		if err := s.audit(ctx, req, binding, "invoke", "succeeded", rec.ID, "", nil); err != nil {
+			return InvokeResult{}, retryable("audit-unavailable", "%v", err)
+		}
+		return InvokeResult{InvocationID: rec.ID, Status: contract.RunSucceeded, Result: result}, nil
+	}
+	var herr *executor.HandlerFailedError
+	if errors.As(err, &herr) {
+		s.auditBestEffort(ctx, req, binding, "invoke", "failed", rec.ID)
+		return InvokeResult{}, terminal("execution-failed", "%v", herr.Err)
+	}
+	if errors.Is(err, executor.ErrExecutionInProgress) {
+		// Loser: nothing executed, nothing written. Terminal
+		// conflict naming the same-key retry; no replay (the
+		// claim is still held) and no automatic retry loop.
+		return InvokeResult{}, terminal("execution-in-progress",
+			"another execution holds invocation %s; retry with the same idempotency key", rec.ID)
+	}
+	if errors.Is(err, executor.ErrExecutionSuperseded) {
+		// Rolled back before committing anything: reload and
+		// replay on the recorded state.
 		fresh, err := s.store.getByID(ctx, tenantID, rec.ID)
 		if err != nil {
 			return InvokeResult{}, retryable("store-unavailable", "%v", err)
 		}
-		return s.replay(ctx, req, binding, tool, fresh)
+		return s.replay(ctx, req, binding, tool, fresh, false)
 	}
-	if status == contract.RunFailed {
-		s.auditBestEffort(ctx, req, binding, "invoke", "failed", rec.ID)
-		return InvokeResult{}, terminal("execution-failed", "%v", errMsg)
-	}
-	if err := s.audit(ctx, req, binding, "invoke", "succeeded", rec.ID, "", nil); err != nil {
-		return InvokeResult{}, retryable("audit-unavailable", "%v", err)
-	}
-	return InvokeResult{InvocationID: rec.ID, Status: contract.RunSucceeded, Result: result}, nil
+	return InvokeResult{}, retryable("store-unavailable", "%v", err)
 }
 
 func (s *Service) executorRequest(req InvokeRequest, binding auth.Binding, rec invocation, runID string) executor.Request {

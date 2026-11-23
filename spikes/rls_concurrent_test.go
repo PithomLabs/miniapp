@@ -20,6 +20,15 @@ import (
 // under concurrency.
 var concTenants = []string{"conc-a", "conc-b", "conc-c", "conc-d"}
 
+// workersPerTenant is hoisted so the fixture pool can be sized from
+// the same constants as the barrier: every participant pins one
+// pool connection across it.
+const workersPerTenant = 2
+
+// concParticipants is the number of workers that must hold open
+// transactions simultaneously at the barrier.
+func concParticipants() int { return len(concTenants) * workersPerTenant }
+
 // concFixture owns the concurrent-isolation fixture: its own table and
 // role, created in setup and dropped in cleanup. Nothing outside these
 // objects is touched.
@@ -67,7 +76,16 @@ func setupConcIsolation(t *testing.T, ctx context.Context) *concFixture {
 			t.Fatal(err)
 		}
 	}
-	pool, err := pgxpool.New(ctx, appRoleDSN(t, dsn, "spike_app_conc", appPassword))
+	poolCfg, err := pgxpool.ParseConfig(appRoleDSN(t, dsn, "spike_app_conc", appPassword))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Size explicitly from the test's own concurrency: every barrier
+	// participant holds one connection across it, and the pgx default
+	// (max(4, NumCPU)) starves the barrier on small machines. +2
+	// headroom covers the post-barrier counts and negative control.
+	poolCfg.MaxConns = int32(concParticipants() + 2)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,12 +129,14 @@ func setupConcIsolation(t *testing.T, ctx context.Context) *concFixture {
 // never timing-based; timeouts below are deadlock backstops that fail
 // loudly, not assertions about speed.
 func TestConcurrentTenantIsolation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	fx := setupConcIsolation(t, ctx)
+	if got := int(fx.pool.Config().MaxConns); got < concParticipants() {
+		t.Fatalf("pool MaxConns=%d < %d barrier participants: barrier would starve", got, concParticipants())
+	}
 
 	tenants := concTenants
-	const workersPerTenant = 2
 	type observation struct {
 		tenant string
 		seen   []string
@@ -185,11 +205,14 @@ func TestConcurrentTenantIsolation(t *testing.T) {
 	total := len(tenants) * workersPerTenant
 	waitFor := func(ch chan struct{}, n int, what string) {
 		t.Helper()
-		for i := 0; i < n; i++ {
+		for got := 0; got < n; {
 			select {
 			case <-ch:
+				got++
+			case err := <-errs:
+				t.Fatalf("worker failed before %s (%d/%d ready): %v", what, got, n, err)
 			case <-ctx.Done():
-				t.Fatalf("deadlock waiting for %s: %v", what, ctx.Err())
+				t.Fatalf("deadlock waiting for %s (%d/%d ready): %v", what, got, n, ctx.Err())
 			}
 		}
 	}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/PithomLabs/miniapp/contract"
 )
 
@@ -19,6 +21,49 @@ var ErrUnknownRun = errors.New("executor: unknown run")
 // no workflow exists for the requested run ID.
 func IsUnknownRun(err error) bool {
 	return errors.Is(err, ErrUnknownRun)
+}
+
+// ErrExecutionInProgress reports that another attempt currently
+// holds the invocation's execution claim. Nothing was executed
+// and nothing was written: the caller must retry with the same
+// idempotency key, converging via replay once the holder commits
+// (or claiming and executing if the holder crashed).
+var ErrExecutionInProgress = errors.New("executor: execution in progress")
+
+// IsExecutionInProgress reports a lost execution claim.
+func IsExecutionInProgress(err error) bool {
+	return errors.Is(err, ErrExecutionInProgress)
+}
+
+// ErrExecutionSuperseded reports that the attempt rolled back
+// before committing anything: either the invocation was already
+// terminal when the claim was acquired, or a concurrent
+// settlement won while this attempt executed. The caller must
+// reload and answer from the recorded state, never by
+// overwriting it.
+var ErrExecutionSuperseded = errors.New("executor: execution superseded")
+
+// IsExecutionSuperseded reports a rolled-back attempt.
+func IsExecutionSuperseded(err error) bool {
+	return errors.Is(err, ErrExecutionSuperseded)
+}
+
+// HandlerFailedError reports that the handler returned an error:
+// its database writes rolled back to savepoint, the FAILED
+// outcome committed, and the claim released. The invocation is
+// terminally failed; audit it and answer execution-failed.
+type HandlerFailedError struct {
+	Err error
+}
+
+// Error returns the failure with the handler's message preserved.
+func (e *HandlerFailedError) Error() string {
+	return "executor: handler failed: " + e.Err.Error()
+}
+
+// Unwrap returns the handler's original error.
+func (e *HandlerFailedError) Unwrap() error {
+	return e.Err
 }
 
 // Request is a validated, authorized invocation ready for execution.
@@ -48,6 +93,25 @@ type Request struct {
 	// with the same RunID attaches to the existing run instead of
 	// starting a second one.
 	RunID string
+	// Claim carries the invocation-scoped callbacks the sync
+	// executor runs inside the attempt transaction (liveness
+	// re-check before the handler, terminal completion after).
+	// Mandatory for production Class A execution: a nil Claim
+	// (or nil callback) fails closed and the handler never runs.
+	Claim *ClaimHooks
+}
+
+// ClaimHooks are invocation-scoped callbacks the sync executor
+// runs inside the attempt transaction. The runtime owns
+// invocation SQL; the executor owns transaction orchestration.
+type ClaimHooks struct {
+	// Recheck reloads invocation liveness after the execution
+	// claim is held. False rolls the attempt back without
+	// reaching the handler.
+	Recheck func(tx pgx.Tx) (live bool, err error)
+	// Complete records the terminal outcome. False rolls the
+	// attempt back: a concurrent settlement won.
+	Complete func(tx pgx.Tx, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error)
 }
 
 // SyncExecutor runs request/response tools to completion inside the

@@ -139,9 +139,23 @@ The approval check must verify the actual persisted decision and its matching au
 
 **Transaction and lock requirements**
 
-Preserve the normative lock order:
+The lifecycle contract §4 is authoritative for lock order. (P20
+MEDIUM-3 correction, mirroring `prompt17.md`: the advisory-last
+line below is superseded and retained struck for provenance —
+the Phase 2 `authorizeAttempt` transaction takes no advisory
+lock at all.)
 
-`invocation → approval → sequence/generation → policy-control/grant snapshot → effect → advisory lock`
+`invocation → approval → sequence/generation → policy-control/grant snapshot → effect → ~~advisory lock~~` — REMOVED.
+
+Preserve the normative lock order for the authorization transaction:
+
+`invocation → approval → sequence/generation → policy-control/grant snapshot → effect`
+
+For operations that actually require advisory locking (Class A
+entity serialization and execution claims), preserve the §4
+outermost-first rule: advisory locks are acquired before any
+transactional row or table locks, in the fixed claim→entity order
+at the single Class A site.
 
 Inspect the actual code and contract for the precise lock acquisition and transaction boundaries. Do not improvise a different order or add locks without analyzing deadlock implications.
 

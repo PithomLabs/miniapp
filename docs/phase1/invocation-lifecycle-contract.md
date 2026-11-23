@@ -263,6 +263,20 @@ waiters. Same-key serialization resolves as holders commit.
 locks 1→5 while the advisory lock is held; with (a)–(c) this
 adds no cycle. QED.
 
+(MEDIUM-2 amendment: Class A execution now takes a second
+advisory lock — the invocation execution claim
+(`TryClaimExecution`, 64-bit `exec-claim:`-namespaced
+`pg_try_advisory_xact_lock`) — before the entity lock, inside
+the same transaction that runs the handler and commits
+completion. The proof extends unchanged in structure: exactly
+one code site acquires both, always in the fixed claim→entity
+order, still with no row locks held; the claim is non-blocking
+(try), so claim contention never waits at all (losers get a
+terminal `execution-in-progress` conflict); entity
+serialization keeps part (c). No reverse path exists.
+Handler-error savepoint rollback does not release the
+transactional claim (verified live on PG19).)
+
 Consequences: the authorization transaction takes 1→2→3→4→5 in
 order; `Cancel` takes 1, then settles approvals (2) and withdraws
 `PENDING` effects (5) — never 5 before 1; `Settle`, takeover, and
@@ -312,7 +326,7 @@ authorization test asserting the defined order.
 | Choke submit / adoptRunID (M1) | 1 invocation | single-row predicated update |
 | Decide (M2) | 2 approval (`FOR UPDATE`) | single-row + predicated update |
 | CancelPending (M2/M6) | 2 approval (predicated `UPDATE`) | |
-| Cancel intent + settle (M6) | 1 invocation → 2 approval → 5 effect (`PENDING→CANCELLED` batch) | one tx; executor stop after commit |
+| Cancel intent + settle (M6) | 1 invocation → 2 approval → 5 effect (`PENDING→CANCELLED` batch) | one tx (X-05 future state; current implementation is correctly multi-tx); executor stop after commit |
 | Effect authorization (M3) | §4.1 `RLock` → 1 → 2 → 3 → 4 → 5 | send strictly after commit |
 | Sweeper S1 redelivery (M2) | 2 approval (read) | signal after commit; no invocation lock held |
 | Sweeper S2 expiry (M2+M1) | 1 invocation → 2 approval, one tx (discovery reads lock-free first) | §7/M2; signal + settle after commit |
@@ -513,6 +527,17 @@ predicates; RLS stays defense in depth.
 | Post-supersede cancel | superseded target + attached | observers re-resolve or settle | attach re-resolve row (§7/M5); cancel of a fenced target follows target-cancel propagation | read + settle | tenant match | — | no observer strands on a dead generation | supersede-cancel test (CR-01) |
 | Post-termination status (attached) | attached + terminal target | reported outcome | resolve + report; cancelled-attached rows report `cancelled` (own lifecycle ended), others report target outcome | read | auth first | — | historical `attached_run_id` available for audit | attach-lifecycle tests |
 
+Run-less records (`pending`, Class A pre-completion) carry no
+`run_id` and cannot be addressed by the `run_id`-keyed Cancel API
+(P20 INFO-7 — intended: nothing is running to stop).
+Effective-trust rule: authorization evaluates the requested trust
+within grant on every entry, so a confirm→autonomous retry floats
+past the approval requirement on the Class A path (executes
+without linkage) while the Class D choke refuses it
+(`errApprovalRequired`, fail-closed); both directions are
+grant-capped (no privilege escalation). Specified behavior, not a
+defect; Phase 2 treats it as such.
+
 ### Owner Decision — Cancellation of an Attached Invocation (ACCEPTED)
 
 Recorded verbatim from the P1 review directive: **DETACH-ONLY.**
@@ -550,6 +575,16 @@ preserved, idempotency, cross-tenant refusal, owner behavior unchanged.
   resume/fail. Prohibited from terminal: submit, park, decide,
   signal-accept, cancel (cancel on `cancelled` redelivers the stop,
   never re-lives).
+  `live` (operation term, P20 INFO-1): `pending, running,
+  waiting_approval, waiting_event` — nonterminal minus
+  `quarantined`. Operation-specific exclusions (all verified in
+  implementation): `cancelIfLive`/`syncIfLive` exclude `pending`
+  (pending records carry no runs; Cancel/Status address by run);
+  `completeIfLive`/`completeTx` include `pending` (undispatched
+  Class A must complete); `failIfWaiting` is waiting-only (poll
+  settlement); `adoptRunID` takes all four live states
+  (restoration adopts from `pending`). Terminal/quarantined are
+  excluded everywhere.
 - **M2 approval.** Terminal: `decided, expired, cancelled`.
   Invariants: a decision is never substituted after the first
   terminal decision (identical re-decide is idempotent, never a
@@ -732,7 +767,7 @@ Final op inventory (each with a firing/boundary/propagation test):
 | `park-update` | `requestApproval` pre-park | rollback (nothing parked) |
 | `audit:approval-requested` | service audit choke | park stands, audit missing → retryable |
 | `runid-persist` | `submitRecorded` + `confirmSubmit` pre-update | rollback (no run recorded, no submit) |
-| `claim-response` | `Invoke` post-claim-commit, pre-dispatch | lost response → retry converges on same record (L-01) |
+| `claim-response` | `Invoke` post-claim-commit, pre-dispatch/park | lost response → retry converges on same record (L-01) |
 | `async-submit` | wrapper pre-`Submit` | run persisted, submit failed (X-02 setup) |
 | `decide-commit` | `Decide` post-validation, pre-UPDATE | rollback (stays pending) |
 | `decide-response` | `Decide` post-commit, pre-return | commit stands; identical retry converges |
@@ -779,7 +814,7 @@ in a named file).
 | X-09 | RC-2 | 6 | EXACT five steps, no weaker alternative: (1) pending v1 work under v1, (2) stop v1, (3) run only v2, (4) prove v2 neither executes nor advances the v1 workflow, (5) restart v1 and prove v1 recovers + executes it; SDK citation is mechanism note only | `TestVersionV2DoesNotExecuteV1Run` |
 | X-10 | gap | 5 | enumerate PENDING/ENQUEUED/DELAYED/SUSPENDED by version (C5 classes) + DEAD-LETTER as its own operator-actionable class (verified resumable: SDK `ResumeWorkflows` re-enqueues every status except SUCCESS/ERROR — v1.9.0 `system_database.go:2877-2918`); dead-lettered run → invocation `quarantined` (nonterminal; operator resume re-lives, operator fail settles — never silently settled failed while resume is available); startup + periodic + queryable counts | `TestForeignVersionNonterminalVisibility` (incl. seeded dead-letter + quarantined-mapping), `TestQuarantineResume`, `TestQuarantineOperatorFail`, `TestQuarantinedStatusVisible`, `TestQuarantineConcurrentDecisions`, `TestResumeAfterCancelRefused` |
 | X-11 | RC-1d | 4, 5 | sweeper §8 (bound + alternatives recorded); commit-time decision audit; mailbox phrase struck; lost-signal + long-wait test | `TestApprovalLostSignalBoundedRecovery` |
-| X-12 | RC-1d | 5 | sweeper S3 + shared `settleTerminal`; no-poll + kill-near-completion tests | `TestSettlementAuditedWithoutPoll` |
+| X-12 | RC-1d | 5 | sweeper S3 + shared `settleTerminal`; no-poll + kill-near-completion tests; post-win settlement-audit backfill scope (P20 LOW-2: win committed + audit write failed → sweeper backfills the missing settlement audit on settled records; deferred, no Phase 1 code) | `TestSettlementAuditedWithoutPoll` |
 | X-13 | RC-1d | 5 | `effect-refused/<reason>` audit per refusal class; no false `ATTEMPTING`; no secrets | `TestRefusalAudited` |
 | X-14 | gap | 5 | skip `pool.Close` on failed shutdown; loud diagnostics + non-zero exit (prod); `t.Errorf` + no-hang (tests); deferred-cleanup audit (no unsafe late close); fault-injected AND real-timeout tests (C6) | `TestShutdownFailurePreservesPool` (fault-injected) + `TestShutdownTimeoutPreservesPool` (new, unresponsive worker) |
 | X-15 | gap | 3, 5 | 000006 setter + `ENABLE ALWAYS` audit trigger; REVOKEs + production role instructions; proof over genuine restricted connections (ephemeral roles + actual runtime role); separate `switch` operator command holding the control DSN (canonical auth; serving process excluded); startup rejects unsafe role config; every flip audited; owner/superuser + same-process residuals recorded | `TestKillSwitchNotHandlerWritable`, `TestKillSwitchOperatorVerb`, `TestKillSwitchFlipAudited`, `TestRuntimeRoleIsRestricted` |
@@ -1002,7 +1037,7 @@ source file was modified; only this document and evidence changed.
 | WS-A 000006/7 | Migration split by workstream (identity vs control plane) | Clear migration ownership per §20 | §12 | `TestMigration000006*` (fresh, dup-diagnostic, delimiter-compat) | 000007 lands in WS-F |
 | WS-A Rule-3 interpretation | Choke requires LIVE linkage (pending/granted), not granted-only | Original §2/§5.3 wording ("granted approval linkage") forbids the reviewed park-submit-wait flow: park submits bound to a PENDING approval; granted-only would force an architecture redesign (submit-on-grant, obsoleting the signal bridge and sweeper S1) — explicitly forbidden. Prompt 15.2's mechanics (S1 redelivery to waiting runs, X-02 submit-if-missing-before-poll, workflow wait + fail-closed-on-missing) all presume pending-linkage submits. Reading "ungranted" as "not covered by a live approval process" | §2 Rule 3, §5 step 3 | X-01/X-02 discriminators (submit bound to pending linkage; missing/denied/expired refused) | OWNER-APPROVED with narrowing (wsc_exit_a_review_plan.md): two permissions recorded verbatim in §2/§5; effect-boundary revalidation specified now, implemented in WS-B |
 | WS-A Rule-3 amendment | Two permissions normative (workflow-start vs business-execution) + authorize-tx verification list | Exit review required the narrowed amendment + owner decision | §2, §5 | entry-path wait proofs (Phase 2); effect test lands in WS-B | none — WS-A proves admission+waiting only, never claims the effect guarantee |
-| WS-B advisory | §4 advisory rule corrected to outermost-first + no-cycle proof (was: "leaf, never held while acquiring") | Old wording reversed the actual Class A order (lock held across handler `Perform` calls); owner-approved exact wording adopted | §4 | call-graph proof (single acquirer, first statement; no other acquirers) | none |
+| WS-B advisory | §4 advisory rule corrected to outermost-first + no-cycle proof (was: "leaf, never held while acquiring") | Old wording reversed the actual Class A order (lock held across handler `Perform` calls); owner-approved exact wording adopted (wording: `docs/prompt19.md` §7 quotation; authorization: `docs/prompt17_plan_approved.md`) | §4 | call-graph proof (single acquirer, first statement; no other acquirers) | none |
 | WS-B L-01 | `claim-response` op implemented as specified (§9 row added) | Was specified but absent (review L-01) | §9 | `TestFaultClaimResponse` (one-shot, replay convergence, single run, audit coherence) | none |
 | WS-B L-02 | §12 preflight wording: dup-only detection + delimiter compat | Described a replaced reject-on-delimiter design | §12 | existing migration tests (dup-diagnostic + delimiter-compat-SUCCEEDS) | none — wording only |
 | WS-B L-03 | §12 compat: legacy raw rows orphaned on re-attempt + dual-read/backfill standing rule | "Lookups keep working" strictly false for multi-colon legacy rows | §12 | existing compat test; no prod rows exist | future encoding changes gated |
@@ -1010,6 +1045,9 @@ source file was modified; only this document and evidence changed.
 | WS-B L-02 | §12 preflight wording: dup-only detection + delimiter compat (was: reject-on-delimiter scanning) | Contract described a design that was replaced; migration never scanned delimiters | §12 | existing `TestMigration000006*` (dup-diagnostic + delimiter-compat-SUCCEEDS) | none — wording only |
 | WS-B L-03 | §12 compatibility: legacy raw rows orphaned on re-attempt + dual-read/backfill standing rule (was: "lookups keep working") | Strictly false for multi-colon legacy rows under the escaped PK | §12 | existing compat test (upgrade succeeds); no prod rows exist | future encoding changes gated on the standing rule |
 | WS-B advisory | §4 advisory rule corrected to outermost-first + no-cycle proof (was: "leaf, never held while acquiring") | Old wording reversed the actual Class A order (lock held across handler `Perform` calls) | §4 | no new test (call-graph proof; covered by existing Class A + effects suites) | none |
+| P20 MEDIUM-2 | Class A single execution: advisory xact claim + single-tx handler/completion + savepoint handler-error semantics + execution-in-progress conflict | Concurrent granted polls / duplicate dispatches double-executed handlers; crash-after-handler-commit double-applied on recovery | §4, §5 | T1/T2/C1/C2/C3/C4/T5/T6 (new) + HIGH-1/M-01/full-suite regressions | non-transactional handler side effects stay outside the guarantee (ledger boundary); post-commit audit still needs X-12 backfill |
+| P20 MEDIUM-2 §4 | No-cycle proof extended to two ordered advisories (claim→entity, single site, try-claim never waits) + savepoint-claim survival | Second advisory lock added by the execution claim | §4 | entity serialization suites + claim contention tests | none |
+| P20 MEDIUM-3 | prompt17:144 + plan-review mirror corrected: §4 authoritative, advisory-last struck, authorizeAttempt takes no advisory lock, outermost-first preserved | Binding work order contradicted corrected §4 (deadlock-prone direction + inapplicable lock) | prompt17.md, prompt17_plan_review.md | repo-wide grep: no advisory-last instructions remain in governing docs (historical reviews/writeups describing the contradiction preserved as records, listed in evidence) | none |
 
 No new architectural conflicts discovered. No owner decision
 invented. OpenCode remains NOT RUN/BLOCKED (unchanged, non-blocking).

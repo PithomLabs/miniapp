@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/PithomLabs/miniapp/contract"
 	"github.com/PithomLabs/miniapp/executor"
 	"github.com/PithomLabs/miniapp/executor/classa"
 	"github.com/PithomLabs/miniapp/internal/store"
@@ -64,6 +65,12 @@ func search(t *testing.T, db *testkit.DB, tenant, input string) []contact {
 		InvocationID: "test-invocation", TenantID: tenant,
 		MiniappID: ID, Version: Version, Tool: ToolSearch,
 		Input: json.RawMessage(input),
+		Claim: &executor.ClaimHooks{
+			Recheck: func(tx pgx.Tx) (bool, error) { return true, nil },
+			Complete: func(tx pgx.Tx, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
+				return true, nil
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("execute: %v", err)

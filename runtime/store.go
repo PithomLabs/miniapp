@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -136,10 +137,12 @@ func (s *invocations) getByRun(ctx context.Context, tenantID, runID string) (inv
 // (CR-05 invariant), never via completion, settle, sync, or agent
 // cancel.
 
-// completeIfLive records a synchronous completion from a live,
-// unclaimed-by-cancellation state: pending (undispatched Class A),
-// running, or waiting_approval (granted Class A awaiting inline
-// execution). A concurrent Cancel wins over the completion.
+// completeIfLive records a synchronous completion from a live
+// state: pending (undispatched Class A), running, or
+// waiting_approval (Class A awaiting inline execution). The live
+// competitor for the transition is a concurrent approval
+// settlement (denied/expired racing the completion): these records
+// carry no run_id, so Cancel cannot address them.
 func (s *invocations) completeIfLive(ctx context.Context, tenantID, id string, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
 	resultArg := ""
 	if len(result) > 0 {
@@ -159,13 +162,17 @@ func (s *invocations) completeIfLive(ctx context.Context, tenantID, id string, s
 }
 
 // failIfWaiting records a poll settlement (denied/expired/approval-
-// cancelled) from the waiting state only.
-func (s *invocations) failIfWaiting(ctx context.Context, tenantID, id, runID, errMsg string) (bool, error) {
+// cancelled) from the waiting state only. It never writes run_id:
+// run identity is owned by adoption, and a settle must not
+// overwrite it with a value captured from an earlier read (CR-05).
+// The runID parameter is retained blanked so pre-fix and post-fix
+// trees share identical regression-test sources.
+func (s *invocations) failIfWaiting(ctx context.Context, tenantID, id string, _ string, errMsg string) (bool, error) {
 	return store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
 		tag, err := tx.Exec(ctx, `UPDATE app.invocations SET status = 'failed',
-			run_id = $1, error = $2, updated_at = now()
-			WHERE id = $3::uuid AND tenant_id = $4 AND status = 'waiting_approval'`,
-			runID, errMsg, id, tenantID)
+			error = $1, updated_at = now()
+			WHERE id = $2::uuid AND tenant_id = $3 AND status = 'waiting_approval'`,
+			errMsg, id, tenantID)
 		if err != nil {
 			return false, err
 		}
@@ -204,6 +211,48 @@ func (s *invocations) cancelIfLive(ctx context.Context, tenantID, id, runID, rea
 	})
 }
 
+// recheckTx reloads invocation liveness inside the caller's
+// attempt transaction (the pre-handler gate). True only for the
+// Class A completion source states; terminal, quarantined, and
+// missing rows are not live.
+func (s *invocations) recheckTx(ctx context.Context, tx pgx.Tx, tenantID, id string) (bool, error) {
+	var status string
+	err := tx.QueryRow(ctx, `SELECT status FROM app.invocations WHERE id = $1::uuid AND tenant_id = $2`,
+		id, tenantID).Scan(&status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	switch contract.RunStatus(status) {
+	case contract.RunPending, contract.RunRunning, contract.RunWaitingApproval:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// completeTx records a synchronous completion inside the caller's
+// attempt transaction: same predicate as completeIfLive, same
+// affected-row report. Zero rows means a concurrent settlement
+// won; the caller must roll back and replay.
+func (s *invocations) completeTx(ctx context.Context, tx pgx.Tx, tenantID, id string, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
+	resultArg := ""
+	if len(result) > 0 {
+		resultArg = string(result)
+	}
+	tag, err := tx.Exec(ctx, `UPDATE app.invocations SET status = $1,
+		result = NULLIF($2, '')::jsonb, error = $3, updated_at = now()
+		WHERE id = $4::uuid AND tenant_id = $5
+		AND status IN ('pending','running','waiting_approval')`,
+		string(status), resultArg, errMsg, id, tenantID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // parkTx transitions one invocation to waiting_approval inside the
 // caller's transaction (the atomic Park's first statement, lock
 // order §4.2 position 1). The predicate accepts pending records
@@ -221,14 +270,18 @@ func parkTx(ctx context.Context, tx pgx.Tx, tenantID, id string) (bool, error) {
 }
 
 // adoptRunID records a minted run ID only when the invocation has
-// neither its own run nor an adopted one. Concurrent same-key
-// submitters race here: exactly one wins the predicate; losers
-// reload and adopt the winner's run instead of minting their own
-// (X-03). Reports whether this call won.
+// neither its own run nor an adopted one AND is in a live state.
+// Concurrent same-key submitters race here: exactly one wins the
+// predicate; losers reload and adopt the winner's run instead of
+// minting their own (X-03). Pending is included (restoration
+// dispatch legitimately adopts from it); terminal and quarantined
+// records can never acquire a run (CR-05). Reports whether this
+// call won.
 func (s *invocations) adoptRunID(ctx context.Context, tenantID, id, runID string) (bool, error) {
 	return store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
 		tag, err := tx.Exec(ctx, `UPDATE app.invocations SET run_id = $1, updated_at = now()
-			WHERE id = $2::uuid AND tenant_id = $3 AND run_id = '' AND attached_run_id = ''`,
+			WHERE id = $2::uuid AND tenant_id = $3 AND run_id = '' AND attached_run_id = ''
+			AND status IN ('pending','running','waiting_event','waiting_approval')`,
 			runID, id, tenantID)
 		if err != nil {
 			return false, err

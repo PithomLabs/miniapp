@@ -49,6 +49,21 @@ func LockEntity(ctx context.Context, tx pgx.Tx, entityKey string) error {
 	return err
 }
 
+// TryClaimExecution attempts an invocation's execution claim: a
+// 64-bit namespaced advisory transaction lock, held if and only
+// if this transaction is alive. True means this attempt now owns
+// execution; false means another attempt holds it (return a
+// conflict without executing). The lock releases at transaction
+// end for any reason — commit, rollback, or crash — so a dead
+// holder can never strand ownership. Domain-separated from
+// entity locks by the 'exec-claim:' prefix and 64-bit hashing.
+func TryClaimExecution(ctx context.Context, tx pgx.Tx, tenantID, invocationID string) (bool, error) {
+	var held bool
+	err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('exec-claim:' || $1 || ':' || $2, 0))`,
+		tenantID, invocationID).Scan(&held)
+	return held, err
+}
+
 func TenantContextSQL() string {
 	return `SELECT set_config('app.tenant_id', $1, true)`
 }

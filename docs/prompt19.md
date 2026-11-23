@@ -194,7 +194,7 @@ The submitted design states:
 
 | Operation                         | Required source state   | Losing transition behavior                                  |
 | --------------------------------- | ----------------------- | ----------------------------------------------------------- |
-| `executeSync` terminal completion | `running` only          | Return terminal cancellation conflict; discard stale result |
+| `executeSync` terminal completion | `pending`/`running`/`waiting_approval` (implementation-correct: undispatched pending and granted waiting Class A records must complete) | Reload and replay the recorded terminal; discard stale result |
 | `settlePollTerminal`              | `waiting_approval` only | Re-observe approval and invocation; answer truthfully       |
 | `Status` synchronization          | Live states only        | Return the current persisted record                         |
 | `Cancel`                          | Live states only        | Already-terminal state becomes the documented no-op         |
