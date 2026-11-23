@@ -40,9 +40,11 @@ All citations are to the post-MEDIUM-1 working tree.
   `ErrAttemptInProgress` for live races, and the age-predicated
   stale→UNKNOWN quarantine (`effects.go:444`, race-safe by
   construction).
-- The contract promises exactly-once provider delivery at the
-  ledger layer (`invocation-lifecycle-contract.md:347`); the
-  ledger — not the handler transaction — is the cross-transaction
+- The ledger provides at-most-once sends per owner plus
+  claim-or-adopt convergence (P21-004 correction: an earlier
+  revision overstated this as "exactly-once provider delivery";
+  the contract explicitly disavows exactly-once); the ledger —
+  not the handler transaction — is the cross-transaction
   idempotency mechanism.
 - The sole production advisory acquisition is
   `store.LockEntity` (`internal/store/store.go:47`,
@@ -337,3 +339,16 @@ Estimated shape: ~120 lines production, ~400 lines tests, zero
 migrations. The design's load-bearing claims (single-tx
 atomicity, claim mutual exclusion, ledger composition) are each
 pinned by a dedicated test above.
+
+## Implementation note (P21-004, added post-implementation)
+
+T6 as specified above (post-commit Kill9) was swapped during
+implementation for a pre-commit discriminator: Kill9 lands while
+the worker is gate-blocked at the completion write, so green
+rolls the whole single-tx attempt back (one business row after
+recovery) while red — whose handler transaction already
+committed — double-applies (two rows). The specified post-commit
+kill is not deterministically stageable without a fault hook;
+the substitute discriminates the same atomicity property more
+directly (T6 red: `business rows after recovery = 2`). No design
+conclusion depended on the post-commit shape.

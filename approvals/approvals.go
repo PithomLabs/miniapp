@@ -289,6 +289,21 @@ func (s *Service) ByInvocation(ctx context.Context, tenantID, invocationID strin
 	})
 }
 
+// ByInvocationTx reads the latest approval linkage for an
+// invocation inside the caller's transaction, holding FOR SHARE
+// (lock-order position 2 for authorization readers). Unlike
+// ByInvocation it fires no fault hook (pure read primitive, like
+// getTxLocked); authorization transactions add their own fault
+// points where crash staging requires them.
+func (s *Service) ByInvocationTx(ctx context.Context, tx pgx.Tx, tenantID, invocationID string) (Record, error) {
+	row := tx.QueryRow(ctx, `SELECT id::text, tenant_id, miniapp_id, miniapp_version, invocation_id,
+		operation, resource, intent_hash, approver_scope, status, requested_by,
+		decided_by, decision, expires_at FROM app.approvals
+		WHERE tenant_id = $1 AND invocation_id = $2
+		ORDER BY created_at DESC LIMIT 1 FOR SHARE`, tenantID, invocationID)
+	return scanRecord(row)
+}
+
 func scanRecord(row pgx.Row) (Record, error) {
 	var r Record
 	var hash, decision string

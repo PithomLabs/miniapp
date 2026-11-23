@@ -1,0 +1,57 @@
+--- /tmp/p25_red7/effects/effects.go	2026-11-23 22:18:59.027597597 +0800
++++ effects/effects.go	2026-11-23 22:27:52.554630991 +0800
+@@ -296,7 +296,9 @@
+ 	if err := s.TestFault.Fire("attempt-begin"); err != nil {
+ 		return contract.EffectRecord{}, err
+ 	}
+-	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeFresh, intent.AttemptID)
++	// Authorize against the persisted epoch from the claim load,
++	// never the caller's Intent.AttemptID (untrusted input).
++	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeFresh, rec.AttemptID)
+ 	if err != nil {
+ 		return contract.EffectRecord{}, err
+ 	}
+@@ -341,12 +343,20 @@
+ 	if err := s.TestFault.Fire("effect-reserve"); err != nil {
+ 		return contract.EffectRecord{}, false, err
+ 	}
++	minted, err := uuid.NewRandom()
++	if err != nil {
++		return contract.EffectRecord{}, false, fmt.Errorf("effects: attempt ID mint failed: %w", err)
++	}
++	attemptID := minted.String()
++	if attemptID == "" {
++		return contract.EffectRecord{}, false, fmt.Errorf("effects: minted attempt ID is empty")
++	}
+ 	inserted, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+ 		tag, err := tx.Exec(ctx, `INSERT INTO app.effect_records
+ 			(business_op_id, tenant_id, attempt_id, idempotency_key, invocation_id, capability_id, operation, payload, state)
+ 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING')
+ 			ON CONFLICT (business_op_id) DO NOTHING`,
+-			intent.BusinessOpID, tenantID, intent.AttemptID, intent.IdempotencyKey, intent.InvocationID,
++			intent.BusinessOpID, tenantID, attemptID, intent.IdempotencyKey, intent.InvocationID,
+ 			intent.Operation.CapabilityID, intent.Operation.Operation, string(intent.Operation.Payload))
+ 		if err != nil {
+ 			return false, err
+@@ -584,6 +594,11 @@
+ // first decision stands; this is terminal, not retryable.
+ var ErrAlreadySettled = errors.New("effects: effect already settled to a different outcome")
+ 
++// ErrPhantomBinding reports settlement (or attribution) for an
++// operation bound to a missing invocation row: a deterministic
++// permanent condition, terminal rather than retryable.
++var ErrPhantomBinding = errors.New("effects: operation is bound to a missing invocation")
++
+ // Settle records an operator decision on a quarantined record in
+ // ONE transaction: predicated UNKNOWN → outcome plus the
+ // effect-settled audit row commit together, or neither does. Only
+@@ -673,6 +688,9 @@
+ func (s *Service) insertSettleAudit(ctx context.Context, tx pgx.Tx, tenantID string, rec contract.EffectRecord, outcome contract.EffectState, note, operator string) error {
+ 	miniapp, version, tool, err := loadIdentityTx(ctx, tx, tenantID, rec.InvocationID)
+ 	if err != nil {
++		if isNoRows(err) {
++			return ErrPhantomBinding
++		}
+ 		return fmt.Errorf("effects: cannot attribute settlement: %w", err)
+ 	}
+ 	details, _ := json.Marshal(map[string]any{

@@ -163,16 +163,19 @@ func p20ChokeFixture(t *testing.T, db *testkit.DB) (*Service, *p20Async) {
 	t.Helper()
 	reg := registry.New()
 	async := &p20Async{}
-	policy := auth.Policy{}
+	policy := auth.NewPolicy(nil, nil)
+	aud := audit.New(db.Pool, nil)
+	approver := approvals.New(db.Pool)
 	effSvc := effects.New(effects.Config{Pool: db.Pool,
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
 		Canceller: EffectCanceller(db.Pool),
 		Policy:    effects.StrictPolicy{Pool: db.Pool, Registry: reg, Grants: policy},
+		Registry:  reg, Grants: policy, Approver: approver, Auditor: aud,
 	})
 	svc, err := New(Config{
 		Registry: reg, Policy: policy, Pool: db.Pool,
 		Sync: classa.New(db.Pool, reg), Async: async,
-		Approver: approvals.New(db.Pool), Auditor: audit.New(db.Pool, nil), Effects: effSvc,
+		Approver: approver, Auditor: aud, Effects: effSvc,
 	})
 	if err != nil {
 		t.Fatal(err)

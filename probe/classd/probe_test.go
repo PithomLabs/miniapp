@@ -32,23 +32,23 @@ const (
 	tenantPB    = "tenant-pb"
 )
 
-func probePolicy() auth.Policy {
+func probePolicy() *auth.Policy {
 	binding := func(agent, tenant string, roles ...string) auth.Binding {
 		return auth.Binding{AgentID: agent, Authority: contract.Authority{
 			Kind: contract.AuthorityUser, ID: agent, TenantID: tenant,
 		}, Roles: roles}
 	}
-	return auth.Policy{
-		Keys: map[string]auth.Binding{
+	return auth.NewPolicy(
+		map[string]auth.Binding{
 			credProber:  binding("agent-probe", tenantPT),
 			credProberB: binding("agent-probe-b", tenantPB),
 			credDecide:  binding("human-op", tenantPT, "tenant-ops"),
 		},
-		Grants: map[string]map[string]contract.TrustMode{
+		map[string]map[string]contract.TrustMode{
 			tenantPT: {classd.ID: contract.TrustConfirm},
 			tenantPB: {classd.ID: contract.TrustConfirm},
 		},
-	}
+	)
 }
 
 func newStack(t *testing.T) *stack.Assembled {
@@ -359,7 +359,7 @@ func TestProbePoisonQuarantine(t *testing.T) {
 	if len(found) != 1 {
 		t.Fatalf("quarantine = %d records, want 1", len(found))
 	}
-	if _, err := fx.Effects.Settle(context.Background(), tenantPT, found[0].BusinessOpID, contract.EffectFailed, "test reconcile: provider has no record"); err != nil {
+	if _, err := fx.Effects.Settle(context.Background(), tenantPT, found[0].BusinessOpID, contract.EffectFailed, "provider has no record", "test-operator"); err != nil {
 		t.Fatalf("settle: %v", err)
 	}
 }

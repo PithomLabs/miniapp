@@ -3,12 +3,14 @@ package classa
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/PithomLabs/miniapp/contract"
+	"github.com/PithomLabs/miniapp/effects"
 	"github.com/PithomLabs/miniapp/executor"
 	"github.com/PithomLabs/miniapp/internal/store"
 	"github.com/PithomLabs/miniapp/registry"
@@ -79,6 +81,15 @@ func (e *Executor) Execute(ctx context.Context, req executor.Request) (json.RawM
 			EntityKey:    req.EntityKey,
 			EffectToken:  req.EffectToken,
 		})
+		if herr != nil && errors.Is(herr, effects.ErrAttemptInProgress) {
+			// Ledger contention, not business failure: roll the
+			// whole attempt back (no FAILED recorded) so a
+			// same-key retry can adopt the winner. The caller
+			// maps this to a terminal conflict, never a terminal
+			// failure — bounded recovery without FAILED
+			// stranding (C6).
+			return nil, executor.ErrAttemptContention
+		}
 		if herr != nil {
 			// Business writes roll back to savepoint while the
 			// FAILED outcome still records below and the claim

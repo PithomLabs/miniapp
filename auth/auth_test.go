@@ -6,18 +6,18 @@ import (
 	"github.com/PithomLabs/miniapp/contract"
 )
 
-func testPolicy() Policy {
-	return Policy{
-		Keys: map[string]Binding{
+func testPolicy() *Policy {
+	return NewPolicy(
+		map[string]Binding{
 			"key-agent-1": {
 				AgentID:   "agent-1",
 				Authority: contract.Authority{Kind: contract.AuthorityUser, ID: "u1", TenantID: "t1"},
 			},
 		},
-		Grants: map[string]map[string]contract.TrustMode{
+		map[string]map[string]contract.TrustMode{
 			"t1": {"crm-read": contract.TrustConfirm},
 		},
-	}
+	)
 }
 
 func testManifest() *contract.MiniappManifest {

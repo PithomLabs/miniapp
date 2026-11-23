@@ -7,7 +7,7 @@
 // frozen pre-remediation copy. A granted poll cannot race a settle
 // on one invocation (approval-state monotonicity — see the Phase 0
 // reachability row), so the completion leg runs through
-// trust-float dispatch: same executeSync/completeIfLive contention,
+// trust-float dispatch: same executeSync/completion contention,
 // reachable and API-level.
 package runtime_test
 
@@ -72,17 +72,17 @@ func (g *p20Gate) shutdown() {
 // p20Policy grants the probe miniapp autonomous trust, so the
 // completion leg floats past the approval requirement while the
 // park leg (confirm) still parks.
-func p20Policy() auth.Policy {
-	return auth.Policy{
-		Keys: map[string]auth.Binding{
+func p20Policy() *auth.Policy {
+	return auth.NewPolicy(
+		map[string]auth.Binding{
 			credAgentA: {AgentID: "agent-a", Authority: contract.Authority{
 				Kind: contract.AuthorityUser, ID: "agent-a", TenantID: tenantA,
 			}},
 		},
-		Grants: map[string]map[string]contract.TrustMode{
+		map[string]map[string]contract.TrustMode{
 			tenantA: {p20Miniapp: contract.TrustAutonomous},
 		},
-	}
+	)
 }
 
 type p20Fixture struct {
@@ -114,6 +114,7 @@ func newP20Fixture(t *testing.T, db *testkit.DB, gate *p20Gate) p20Fixture {
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
 		Canceller: runtime.EffectCanceller(db.Pool),
 		Policy:    effects.StrictPolicy{Pool: db.Pool, Registry: reg, Grants: policy},
+		Registry:  reg, Grants: policy, Approver: approver, Auditor: aud,
 	})
 	svc, err := runtime.New(runtime.Config{
 		Registry: reg, Policy: policy, Pool: db.Pool,
@@ -351,7 +352,7 @@ func TestP20SettleWinsOverCompletion(t *testing.T) {
 }
 
 // TestP20CompletionWinsOverSettle forces completion-first: B's
-// completion queues at completeIfLive (verified as the sole
+// completion UPDATE queues at the row gate (verified as the sole
 // waiter while it is the only request in flight), then A's settle
 // queues behind it, and the release commits in queue order. The
 // post-hoc assertions admit only the completion-first outcome:
@@ -372,7 +373,7 @@ func TestP20CompletionWinsOverSettle(t *testing.T) {
 		holder, rd := p20Stage(t, db, fx, gate, key, bOut, &wg)
 		// B proceeds first and must be the SOLE waiter: it is the
 		// only request in flight, so the quorum proves B reached
-		// completeIfLive before A starts.
+		// the completion UPDATE before A starts.
 		gate.shutdown()
 		if _, ok := waitBlockedByHolder(t, db, holder, "app.invocations", 1); !ok {
 			rd.failf("round %d: completion gate never formed", round)

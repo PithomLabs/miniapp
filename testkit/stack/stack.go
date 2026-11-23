@@ -34,7 +34,7 @@ type Assembled struct {
 	Effects  *effects.Service
 	Exec     *dbosexec.Executor
 	DB       *testkit.DB
-	Policy   auth.Policy
+	Policy   *auth.Policy
 	Registry *registry.Registry
 }
 
@@ -45,9 +45,10 @@ type Config struct {
 	DB *testkit.DB
 	// Register admits the suite's miniapps.
 	Register func(t *testing.T, reg *registry.Registry)
-	// Policy carries keys and grants. Maps are shared, so tests
-	// that mutate them observe live revalidation.
-	Policy auth.Policy
+	// Policy carries keys and grants (shared pointer: mutation
+	// via the setter API is observed live). Maps must never be
+	// written directly; use SetGrants.
+	Policy *auth.Policy
 	// Channels dispatches effect capabilities (usually mocks).
 	Channels map[string]effects.Channel
 	// Logger receives DBOS output; nil discards it.
@@ -67,13 +68,14 @@ func Assemble(t *testing.T, cfg Config) *Assembled {
 	if err != nil {
 		t.Fatal(err)
 	}
+	approver := approvals.New(cfg.DB.Pool)
+	aud := audit.New(cfg.DB.Pool, nil)
 	eff := effects.New(effects.Config{Pool: cfg.DB.Pool,
 		Channels:  cfg.Channels,
 		Canceller: runtime.EffectCanceller(cfg.DB.Pool),
 		Policy:    effects.StrictPolicy{Pool: cfg.DB.Pool, Registry: reg, Grants: cfg.Policy},
+		Registry:  reg, Grants: cfg.Policy, Approver: approver, Auditor: aud,
 	})
-	approver := approvals.New(cfg.DB.Pool)
-	aud := audit.New(cfg.DB.Pool, nil)
 	svc, err := runtime.New(runtime.Config{
 		Registry: reg, Policy: cfg.Policy, Pool: cfg.DB.Pool,
 		Sync: classa.New(cfg.DB.Pool, reg), Async: ex,

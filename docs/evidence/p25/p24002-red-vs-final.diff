@@ -1,0 +1,121 @@
+--- /tmp/p25_red2/effects/effects.go	2026-11-23 22:04:12.540591978 +0800
++++ effects/effects.go	2026-11-23 22:27:52.554630991 +0800
+@@ -81,7 +81,11 @@
+ // ledger row. InvocationID links the effect to its canonical
+ // invocation for cancellation gating and attribution.
+ type Intent struct {
+-	BusinessOpID   string
++	BusinessOpID string
++	// AttemptID is retained for wire compatibility only.
++	// Deprecated: the framework mints the authoritative
++	// attempt ID at claim time; this field is never
++	// persisted and never authorizes.
+ 	AttemptID      string
+ 	IdempotencyKey string
+ 	InvocationID   string
+@@ -292,7 +296,9 @@
+ 	if err := s.TestFault.Fire("attempt-begin"); err != nil {
+ 		return contract.EffectRecord{}, err
+ 	}
+-	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeFresh, intent.AttemptID)
++	// Authorize against the persisted epoch from the claim load,
++	// never the caller's Intent.AttemptID (untrusted input).
++	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeFresh, rec.AttemptID)
+ 	if err != nil {
+ 		return contract.EffectRecord{}, err
+ 	}
+@@ -328,17 +334,29 @@
+ 
+ // claim inserts the PENDING record, or loads the existing one when
+ // this business operation was already attempted. The boolean reports
+-// whether this call owns the first attempt.
++// whether this call owns the first attempt. The attempt ID is
++// always framework-minted here: caller-supplied
++// Intent.AttemptID is never persisted (empty, malformed,
++// colliding, or attacker-chosen values are all ignored). A
++// mint failure fails closed before any write.
+ func (s *Service) claim(ctx context.Context, tenantID string, intent Intent) (contract.EffectRecord, bool, error) {
+ 	if err := s.TestFault.Fire("effect-reserve"); err != nil {
+ 		return contract.EffectRecord{}, false, err
+ 	}
++	minted, err := uuid.NewRandom()
++	if err != nil {
++		return contract.EffectRecord{}, false, fmt.Errorf("effects: attempt ID mint failed: %w", err)
++	}
++	attemptID := minted.String()
++	if attemptID == "" {
++		return contract.EffectRecord{}, false, fmt.Errorf("effects: minted attempt ID is empty")
++	}
+ 	inserted, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+ 		tag, err := tx.Exec(ctx, `INSERT INTO app.effect_records
+ 			(business_op_id, tenant_id, attempt_id, idempotency_key, invocation_id, capability_id, operation, payload, state)
+ 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING')
+ 			ON CONFLICT (business_op_id) DO NOTHING`,
+-			intent.BusinessOpID, tenantID, intent.AttemptID, intent.IdempotencyKey, intent.InvocationID,
++			intent.BusinessOpID, tenantID, attemptID, intent.IdempotencyKey, intent.InvocationID,
+ 			intent.Operation.CapabilityID, intent.Operation.Operation, string(intent.Operation.Payload))
+ 		if err != nil {
+ 			return false, err
+@@ -448,8 +466,8 @@
+ 	affected, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (int64, error) {
+ 		tag, err := tx.Exec(ctx, `UPDATE app.effect_records SET state = $1, provider_request = $2,
+ 			provider_reply = $3, updated_at = now()
+-			WHERE business_op_id = $4 AND tenant_id = $5 AND state = $6`,
+-			string(r.State), req, reply, r.BusinessOpID, tenantID, string(rec.State))
++			WHERE business_op_id = $4 AND tenant_id = $5 AND state = $6 AND attempt_id = $7`,
++			string(r.State), req, reply, r.BusinessOpID, tenantID, string(rec.State), rec.AttemptID)
+ 		if err != nil {
+ 			return 0, err
+ 		}
+@@ -576,6 +594,11 @@
+ // first decision stands; this is terminal, not retryable.
+ var ErrAlreadySettled = errors.New("effects: effect already settled to a different outcome")
+ 
++// ErrPhantomBinding reports settlement (or attribution) for an
++// operation bound to a missing invocation row: a deterministic
++// permanent condition, terminal rather than retryable.
++var ErrPhantomBinding = errors.New("effects: operation is bound to a missing invocation")
++
+ // Settle records an operator decision on a quarantined record in
+ // ONE transaction: predicated UNKNOWN → outcome plus the
+ // effect-settled audit row commit together, or neither does. Only
+@@ -645,12 +668,29 @@
+ 	return settled, nil
+ }
+ 
++// loadIdentityTx reads an invocation's immutable identity columns
++// without taking any lock. Attribution needs miniapp, version, and
++// tool only, and no UPDATE path mutates them (all six mutation
++// sites write status, run, result, error, or timestamps), so the
++// unlocked read cannot tear. Settle uses this after holding the
++// effect row, keeping the §4.2 footprint "5 effect" only — never
++// recreating the effect → invocation edge.
++func loadIdentityTx(ctx context.Context, tx pgx.Tx, tenantID, invocationID string) (miniapp, version, tool string, err error) {
++	err = tx.QueryRow(ctx, `SELECT miniapp_id, miniapp_version, tool
++		FROM app.invocations WHERE id = $1::uuid AND tenant_id = $2`,
++		invocationID, tenantID).Scan(&miniapp, &version, &tool)
++	return miniapp, version, tool, err
++}
++
+ // insertSettleAudit records the settlement inside the settling
+ // transaction: the terminal outcome and its audit commit
+ // together, so a committed settlement is never unaudited.
+ func (s *Service) insertSettleAudit(ctx context.Context, tx pgx.Tx, tenantID string, rec contract.EffectRecord, outcome contract.EffectState, note, operator string) error {
+-	inv, err := loadInvocationTx(ctx, tx, tenantID, rec.InvocationID)
++	miniapp, version, tool, err := loadIdentityTx(ctx, tx, tenantID, rec.InvocationID)
+ 	if err != nil {
++		if isNoRows(err) {
++			return ErrPhantomBinding
++		}
+ 		return fmt.Errorf("effects: cannot attribute settlement: %w", err)
+ 	}
+ 	details, _ := json.Marshal(map[string]any{
+@@ -660,7 +700,7 @@
+ 	return s.auditor.InsertTx(ctx, tx, audit.Event{
+ 		TenantID: tenantID, AgentID: operator,
+ 		AuthorityKind: string(contract.AuthorityUser), AuthorityID: operator,
+-		MiniappID: inv.miniapp, Version: inv.version, Tool: inv.tool,
++		MiniappID: miniapp, Version: version, Tool: tool,
+ 		InvocationID: rec.InvocationID,
+ 		Action:       "effect-settled", Outcome: strings.ToLower(string(outcome)),
+ 		Details: details,

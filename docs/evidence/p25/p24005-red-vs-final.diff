@@ -1,0 +1,45 @@
+--- /tmp/p25_red5/effects/authorize.go	2026-11-23 22:14:46.798746260 +0800
++++ effects/authorize.go	2026-11-23 22:27:52.553630949 +0800
+@@ -191,6 +191,16 @@
+ 	// Lock 1: invocation identity + liveness + token + tool/trust.
+ 	inv, err := loadInvocationTx(ctx, tx, tenantID, intent.InvocationID)
+ 	if err != nil {
++		if isNoRows(err) {
++			// Deterministic permanent condition (forged ID
++			// or phantom-bound op): terminal binding
++			// refusal, routed through the refusal-audit
++			// path (which skips as unattributable — nothing
++			// was loaded). Genuine connection errors stay
++			// retryable below.
++			return authzDecision{}, &RefusalError{Reason: RefusalBindingMismatch,
++				Msg: "invocation has no row; the binding is invalid"}
++		}
+ 		return authzDecision{}, err
+ 	}
+ 	*attr = inv
+@@ -221,8 +231,23 @@
+ 	if err != nil {
+ 		return authzDecision{}, &RefusalError{Reason: RefusalBindingMismatch, Msg: fmt.Sprintf("unknown tool %s", inv.tool)}
+ 	}
+-	// Lock 2: approval linkage (gated tools only).
+-	if tool.Approval.Required {
++	// Persisted-trust admission: the manifest's declared TrustModes
++	// admit the invocation's persisted trust, independent of the
++	// approval linkage below. An empty list declares no restriction
++	// (legacy manifests); an explicit list refuses anything
++	// unlisted, so the linkage exception can never launder a
++	// manifest-disallowed trust mode. Caller claims cannot
++	// influence this: Intent carries no trust field.
++	if len(tool.TrustModes) > 0 && !trustAdmitted(tool.TrustModes, inv.trust) {
++		return authzDecision{}, &RefusalError{Reason: RefusalTrustModeMismatch,
++			Msg: fmt.Sprintf("tool %s does not admit %s trust", inv.tool, inv.trust)}
++	}
++	// Lock 2: approval linkage (gated tools only), skipped when the
++	// persisted invocation trust is autonomous and the manifest
++	// explicitly permits autonomous execution — mirroring the
++	// submit-time choke, which admits autonomous gated workflows
++	// without linkage. All other checks still apply.
++	if tool.Approval.Required && !autonomousLinkageExempt(tool, inv.trust) {
+ 		appr, err := s.approver.ByInvocationTx(ctx, tx, tenantID, intent.InvocationID)
+ 		if err != nil {
+ 			if isNoRows(err) {

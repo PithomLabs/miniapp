@@ -29,7 +29,7 @@ type PolicyChecker interface {
 type StrictPolicy struct {
 	Pool     *pgxpool.Pool
 	Registry *registry.Registry
-	Grants   auth.Policy
+	Grants   *auth.Policy
 }
 
 // CheckPolicy enforces, in order: invocation binding (token match),
@@ -57,11 +57,7 @@ func (p StrictPolicy) CheckPolicy(ctx context.Context, tenantID string, intent I
 	if err != nil {
 		return fmt.Errorf("effects: %w", err)
 	}
-	names := []string{"global", contract.ScopeID("tenant", tenantID), "miniapp:" + inv.miniapp,
-		"capability:" + intent.Operation.CapabilityID}
-	if tool.Limits.KillSwitch != "" {
-		names = append(names, tool.Limits.KillSwitch)
-	}
+	names := killSwitchNames(tenantID, inv.miniapp, intent.Operation.CapabilityID, tool.Limits.KillSwitch)
 	var hit string
 	err = p.Pool.QueryRow(ctx, `SELECT name FROM app.kill_switches
 		WHERE name = ANY($1) AND engaged LIMIT 1`, names).Scan(&hit)
@@ -72,6 +68,19 @@ func (p StrictPolicy) CheckPolicy(ctx context.Context, tenantID string, intent I
 		return err
 	}
 	return nil
+}
+
+// killSwitchNames is the single source for applicable switch
+// names, shared by the pre-claim coarse gate and the
+// authorization transaction: global, tenant, miniapp,
+// capability, plus the tool-declared switch when present.
+func killSwitchNames(tenantID, miniapp, capabilityID, toolSwitch string) []string {
+	names := []string{"global", contract.ScopeID("tenant", tenantID), "miniapp:" + miniapp,
+		"capability:" + capabilityID}
+	if toolSwitch != "" {
+		names = append(names, toolSwitch)
+	}
+	return names
 }
 
 type invocationPolicy struct {

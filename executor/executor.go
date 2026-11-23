@@ -27,7 +27,9 @@ func IsUnknownRun(err error) bool {
 // holds the invocation's execution claim. Nothing was executed
 // and nothing was written: the caller must retry with the same
 // idempotency key, converging via replay once the holder commits
-// (or claiming and executing if the holder crashed).
+// (or claiming and executing if the holder crashed — for pending
+// or waiting records; running records answer interrupted/new-key
+// per replay semantics).
 var ErrExecutionInProgress = errors.New("executor: execution in progress")
 
 // IsExecutionInProgress reports a lost execution claim.
@@ -46,6 +48,20 @@ var ErrExecutionSuperseded = errors.New("executor: execution superseded")
 // IsExecutionSuperseded reports a rolled-back attempt.
 func IsExecutionSuperseded(err error) bool {
 	return errors.Is(err, ErrExecutionSuperseded)
+}
+
+// ErrAttemptContention reports that the handler's ledger attempt
+// lost contention: another attempt owns the operation. The whole
+// attempt transaction rolled back — nothing committed, no FAILED
+// recorded. The caller must retry with the same idempotency key,
+// converging via replay or adopting the winner (for pending or
+// waiting records; running records answer interrupted/new-key
+// per replay semantics).
+var ErrAttemptContention = errors.New("executor: effect attempt contention")
+
+// IsAttemptContention reports a rolled-back ledger contention.
+func IsAttemptContention(err error) bool {
+	return errors.Is(err, ErrAttemptContention)
 }
 
 // HandlerFailedError reports that the handler returned an error:

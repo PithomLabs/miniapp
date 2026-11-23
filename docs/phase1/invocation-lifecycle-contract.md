@@ -191,7 +191,7 @@ finding and every F-01–F-14 residual has exactly one primary owner.
 | M2 | Approval | `pending, decided, expired, cancelled` (rows in `app.approvals`) | `approvals` + `runtime` bridge |
 | M3 | Effect / attempt | `PENDING, ATTEMPTING, CONFIRMED, FAILED, UNKNOWN, RECONCILING, NOT_APPLIED, CANCELLED` (`contract.ValidEffectTransitions`; `CANCELLED` = withdrawn before attempt authorization, wired per §10/X-23 reassessment — never attempted, never retried) | `effects` |
 | M4 | Workflow / run identity | run ownership (`run_id` / `attached_run_id`), signal delivery (verified / accepted / processed, §7/X-06), foreign-version visibility classes (§7/X-10) | `executor/dbos` + `runtime` store |
-| M5 | Sequence / attachment | probe generation claim (`active, superseded, done`), attach linkage | `probe/classd` + M1 attach columns |
+| M5 | Sequence / attachment | probe generation claim (`active, superseded, done`), attach linkage — generation FENCING deferred per P24-004 (probe-scoped, mock-only; activation trigger in §7/M5) | `probe/classd` + M1 attach columns |
 | M6 | Cancellation | invocation cancel intent, approval settlement, executor stop, in-flight report | `runtime` + `effects.LiveEffects` |
 | D1 | Control-plane authorization | kill-switch `engaged` transitions, operator authentication | migration 000006 + `cmd/miniapp switch` |
 | D2 | CI enforcement | skip-fast gates, provisioned DB service, sanctioned invocation | `.github/workflows/ci.yml` + testkit |
@@ -249,7 +249,7 @@ per CR-04 — sequence, policy-control, and grant rows added):
 
 No-cycle proof (from the actual call graph): (a) exactly one
 production site acquires advisory locks —
-`executor/classa/classa.go:41`, always as the first lock operation
+`executor/classa/classa.go` `Execute` (claim call, then entity call — P21-004: was `:41`, refreshed), always as the first lock operations
 in a fresh transaction (verified: `LockEntity` precedes all
 handler work; `executeSync`/`dispatch` hold no PG locks across
 the call); Class B/C/D, runtime, approvals, effects, and sweeper
@@ -323,16 +323,17 @@ authorization test asserting the defined order.
 | Transaction | Locks in order | Notes |
 |---|---|---|
 | Park (M1) | 1 invocation (`FOR UPDATE`) → 2 approval (`INSERT`) | §7/M1; audit is lock-free append |
-| Choke submit / adoptRunID (M1) | 1 invocation | single-row predicated update |
+| Choke submit / adoptRunID (M1) | 1 invocation | single-row predicated update; adoption on `pending` atomically marks `running` in the same UPDATE (P21-002: pending ⟹ unsubmitted, so liveness predicates need no pending-with-run case) |
 | Decide (M2) | 2 approval (`FOR UPDATE`) | single-row + predicated update |
 | CancelPending (M2/M6) | 2 approval (predicated `UPDATE`) | |
 | Cancel intent + settle (M6) | 1 invocation → 2 approval → 5 effect (`PENDING→CANCELLED` batch) | one tx (X-05 future state; current implementation is correctly multi-tx); executor stop after commit |
 | Effect authorization (M3) | §4.1 `RLock` → 1 → 2 → 3 → 4 → 5 | send strictly after commit |
+| Class A attempt (M1, P21-003) | advisory claim → advisory entity → 1 invocation (predicated completion) | advisories outermost in fixed claim→entity order at the single Class A site; handler direct-SQL + completion row lock nest inside; no advisory wait (try-claim) |
 | Sweeper S1 redelivery (M2) | 2 approval (read) | signal after commit; no invocation lock held |
 | Sweeper S2 expiry (M2+M1) | 1 invocation → 2 approval, one tx (discovery reads lock-free first) | §7/M2; signal + settle after commit |
 | Sweeper S3 settlement (M1) | 1 invocation (predicated `settleTerminal`) | status read precedes, lock-free |
 | Supersede (M5) | 3 sequence (`UPDATE`) | fence enforced at M3 authorization, not here |
-| Settle operator (M3) | 5 effect (single predicated `UPDATE`, atomic — directive §3.3) | + idempotent `effect-settled` audit |
+| Settle operator (M3) | 5 effect ONLY (single predicated `UPDATE`, atomic — directive §3.3; attribution via lock-free immutable-identity read, never `FOR UPDATE` — P24-003; verified: zero `FOR UPDATE` in `effects.go`, no FKs/triggers) | + idempotent `effect-settled` audit |
 | Sequence claim (M5) | 3 sequence only (`UPDATE` supersede + partial-unique `INSERT`) | one step-tx; never touches 1/2/5 |
 | True attachment (M5+M1) | 3 sequence (claim-step tx, released) THEN 1 invocation (attach tx) | separate sequential txs; generation read released before attach write |
 | Takeover / adopt (M3) | 5 effect only per tx (predicated); re-authorization opens a FRESH tx at §4 order (never holds 5 across it) | separate txs; a takeover never retains an effect-row lock while beginning invocation/sequence authorization |
@@ -455,7 +456,11 @@ predicates; RLS stays defense in depth.
 |---|---|---|---|---|---|---|---|---|
 | Invoke (first claim) | — | `pending` (gated) / `running` | `INSERT ... ON CONFLICT DO NOTHING` on idempotency unique; affected=1 wins | one tx | authenticate + authorize + entity admission before claim (X-24b: auth before registry resolve) | `invoke/dispatched` (mandatory; failure → retryable) | store error → retryable, no row | `TestInvokeClassAHappyPath`, `TestInvokeRejections` (kept), `TestSubmitChokePointCallerSet` (§5 proof), `TestInvokeEntityDerived`, `TestInvokeEntityMissingFails` (kept) |
 | Same-key retry | `pending` | dispatch | reload row; dispatch on observed state | read + handler tx | same as first claim | `invoke/duplicate` (best-effort) | — | `TestInvokeIdempotentReplay` (kept) |
-| Same-key retry | `running`/`waiting_event` | same + handle | choke point (§5) + predicated `adoptRunID` | handler tx | choke approval check | `invoke/duplicate` | submit error → record stays live → retry re-enters | `TestConcurrentSubmitSameKey` (X-03) |
+| Same-key retry | `running`/`waiting_event` | same + handle | choke point (§5) + predicated `adoptRunID` (Class D; Class A excepted — see interrupted row below) | handler tx | choke approval check | `invoke/duplicate` | submit error → record stays live → retry re-enters | `TestConcurrentSubmitSameKey` (X-03) |
+| Class A attempt (P21-003) | `pending`/`running`/`waiting_approval` | terminal | advisory execution claim (try, non-blocking) + entity lock, then handler + predicated in-tx completion; zero rows → whole attempt rolls back + reload/replay | single attempt tx | entry authorization (claim carries no authority) | `invoke/succeeded` or `invoke/failed` on win, exactly once | claim busy → terminal `execution-in-progress` conflict (same-key retry); pre-handler terminal → replay without executing | T1/T2/C3/T6 + C1/C2/C4 units |
+| `execution-in-progress` (P21-003) | attempt | terminal 409 conflict | claim held by another attempt; names same-key retry; loser writes nothing and executes nothing | no tx held (prompt refusal) | — | no audit on the conflict itself | explicit same-key retry converges via replay (success) or re-claims (post-crash) | C3 promptness + untouched-row + retry test |
+| Same-key retry, Class A (P21-003) | `running` + Class A | `interrupted` (terminal) | fail-closed: prior attempt did not complete; resubmit under a new key | read | — | `invoke/duplicate` | never re-dispatches the live attempt | existing `interrupted` replay tests |
+| Class A grant→execute (P21-003) | `waiting_approval` + granted | terminal | granted poll enters the Class A attempt above (no workflow submit for Class A) | attempt tx | stored granted linkage | win audits as attempt row | denial/expiry settle instead (converge rows) | T1 granted-poll test |
 | Park | `pending` (gated) | `waiting_approval` | ONE tx in §4 order (CR-02): 1 invocation `FOR UPDATE` + predicated park-`UPDATE`, THEN 2 approval `INSERT`, then `approval-requested` audit; commit rolls all three together | one tx | approval requirement from manifest | `approval-requested/pending` exactly once per invocation | any failure → all three roll back → retryable; retry re-parks under the same idempotency identity (dangling-row adoption retained ONLY as defensive recovery for legacy/pre-existing rows, built from fixture — Z CR-05) | `TestApprovalRetryAfterSubmitFailure`, `TestApprovalRetryAfterParkFailure` (adoption leg from fixture), crash-between-claim-and-park (X-01) |
 | Submit-after-park | `waiting_approval` + approval `pending` | same + run | choke point with stored linkage; run-ID adoption | submit tx | stored linkage | submit failure → `submit-failed` retryable | `TestApprovalPollSubmitsIfMissing` (X-02) |
 | Grant converge | `waiting_approval`, approval decided/approve | `running` + handle | submit-if-missing (stored linkage) then executor `Status` | submit tx + status read | linkage intent-hash match | grant observed (`approval-denied` n/a) | never-submitted run → submit first, then converge | `TestApprovalGrantAfterSubmitFailure` (new, X-02) |
@@ -480,13 +485,20 @@ predicates; RLS stays defense in depth.
 | Event | Source | Dest | Predicate / lock | Atomicity | Auth | Audit | Failure exit → recovery | Test |
 |---|---|---|---|---|---|---|---|---|
 | Claim (new) | no row | `PENDING` (provisional) | conditional `INSERT` (idempotency on business-op PK; no authorization implied) | one tx | BusinessOpID scope gate only | — | conflict → existing-row path | `TestCancelDuringClaim` (X-05) |
-| Authorize attempt | `PENDING` | `ATTEMPTING` (point of no return) | ONE tx in §4 order: §4.1 `RLock` → 1 invocation `FOR UPDATE` (live?) → 2 approval `FOR SHARE` (linkage?) → 3 sequence `FOR SHARE` (generation fence, if sequence-bound) → 4 switches `FOR SHARE` + pinned grants → 5 predicated `UPDATE ... WHERE state='PENDING'` + lease/owner check | one tx; send strictly after commit | full StrictPolicy in-tx + fence identity from trusted context | refusal → `effect-refused/<reason>` audit (no `ATTEMPTING` row — Rule 5, X-13) | cancel/supersede/revoke-first → transition fails → `PENDING` withdrawn to `CANCELLED` (terminal, never attempted); attempt-first → in flight | `TestCancelBetweenPendingAndAttempting` (new, pause-based), `TestRefusalAudited` (X-13), `TestSupersededGenerationCannotAttempt` (X-08/CR-04) |
-| Withdraw (cancel-won) | `PENDING` | `CANCELLED` (terminal) | predicated `UPDATE ... WHERE state='PENDING'` (eager batch in M6 cancel tx; lazy backstop on next touch) | cancel tx / touch tx | cancel intent (M6) | `effect-withdrawn` with invocation + op (distinct from failure) | never retried, never counted as a provider attempt | cancel-path tests (M6) |
+| Authorize attempt | `PENDING` | `ATTEMPTING` (point of no return) | ONE tx in §4 order: §4.1 `RLock` → 1 invocation `FOR UPDATE` (live?) → persisted-trust admission (trust ∈ declared `TrustModes`, empty = unrestricted; else `trust-mode-mismatch`) → 2 approval `FOR SHARE` (linkage? — SKIPPED iff persisted trust autonomous AND manifest explicitly permits autonomous, P24-005 option (a)) → 3 sequence `FOR SHARE` (generation fence, if sequence-bound; deferred per P24-004) → 4 switches `FOR SHARE` + pinned grants → 5 predicated `UPDATE ... WHERE state='PENDING'` + lease/owner check | one tx; send strictly after commit | full StrictPolicy in-tx + fence identity from trusted context | refusal → `effect-refused/<reason>` audit (no `ATTEMPTING` row — Rule 5, X-13) | cancel/supersede/revoke-first → transition fails → `PENDING` withdrawn to `CANCELLED` (terminal, never attempted); attempt-first → in flight | `TestCancelBetweenPendingAndAttempting` (new, pause-based), `TestRefusalAudited` (X-13), `TestSupersededGenerationCannotAttempt` (X-08/CR-04), `TestP25M1–M7` (P24-005 matrix) |
+| Withdraw (cancel-won) | `PENDING` | `CANCELLED` (terminal) | predicated `UPDATE ... WHERE state='PENDING'` (eager batch in M6 cancel tx; lazy backstop on next touch) | cancel tx / touch tx | cancel intent (M6) | `effect-withdrawn` with invocation + op (distinct from failure), committed atomically with the winning transition in the authorize tx — exactly one per win, repeats refuse (P24-001) | never retried, never counted as a provider attempt | cancel-path tests (M6), `TestP25POC1*`, `TestP25TerminalWithdraw*` |
 | Claim (existing) | `PENDING`/`ATTEMPTING` | adopt/takeover/quarantine/withdraw | lease + age-predicated transitions; stale-`PENDING` takeover and `NOT_APPLIED` retry route through the Authorize-attempt tx (a new authorization, not a shortcut); post-cancel touch withdraws to `CANCELLED` | per-op tx | settled reads skip gates; live paths re-gate | — | contention → `ErrAttemptInProgress`; stale → takeover/UNKNOWN | `TestConcurrentDuplicateClaims`, `TestStalePendingTakeoverSendsOnce`, `TestPerformAdoptsStrandedAttempt` (kept); stale-resume interleaving (F-03, §11) |
-| Send | `ATTEMPTING` | `CONFIRMED`/`FAILED`/`UNKNOWN` | authorized `PENDING→ATTEMPTING` precedes every send (§4/CR-03); settlement predicated on `ATTEMPTING` | authorize tx, then send, then settle tx | — | outcome via ledger; mock log per attempt (X-07) | unknown → quarantine, never blind retry | `TestCancelDuringAttempt` (X-05), `TestMockRecordsEveryAttempt` (X-07) |
+| Send | `ATTEMPTING` | `CONFIRMED`/`FAILED`/`UNKNOWN` | authorized `PENDING→ATTEMPTING` precedes every send (§4/CR-03); settlement predicated on `ATTEMPTING` + attempt epoch — a stale worker's outcome lands zero rows and reports superseded, never overwrites (P24-002) | authorize tx, then send, then settle tx | — | outcome via ledger; mock log per attempt (X-07) | unknown → quarantine, never blind retry | `TestCancelDuringAttempt` (X-05), `TestMockRecordsEveryAttempt` (X-07), `TestP25POC2*` |
 | Settle (operator) | `UNKNOWN` | terminal (direct) | ATOMIC single predicated `UPDATE ... WHERE state='UNKNOWN'` (directive §3.3 decision — the two-tx `RECONCILING` intermediate is removed from the machine; no strandable middle state exists) | one tx | operator surface only — CLI `settle` verb with canonical auth (doc-spec §12; never a worker) | `effect-settled/<outcome>` with evidence note; idempotent on (op, outcome, note): same → success + audit backfill if missing; different → conflict error (covers crash between state commit and audit) | non-UNKNOWN refused; concurrent settlers serialize on the predicate (one wins) | `TestSettleAndListUnknown` (updated), `TestSettleAudited` (new), `TestSettleCrashConverges` (new, fault-injected kill between commit and audit) |
 | Retry-after-reconcile | `NOT_APPLIED` | `ATTEMPTING` | via Authorize-attempt tx (predicated on `NOT_APPLIED` + full revalidation — makes the §10/X-23 edge reachable) | authorize tx, then normal send path | full authorization re-run | — | — | `TestReconcileRetryAfterNotApplied` (new) |
 | Refusal | any pre-claim | (no row) | n/a — refusal is the absence of a claim | audit tx | reason: cancelled / token / grant / switch (attributed, X-13) | `effect-refused` with tenant, invocation, op, rule, timestamp; never an `ATTEMPTING` row; never secrets | — | `TestRefusalAudited` per reason |
+
+P24-008 gating prerequisite: before the first non-mock
+provider is enabled, authorization must verify that the
+requested capability belongs to the admitted tool's declared
+capability set. Mock-only operation is unaffected;
+real-provider admission is refused until this membership
+check lands with its tests.
 
 ### M4 — Workflow / run identity (`executor/dbos` + store)
 
@@ -513,6 +525,23 @@ predicates; RLS stays defense in depth.
 | Generation fence (CR-04) | any attempt by a superseded generation | refused (no `ATTEMPTING`) | fence enforced INSIDE the M3 Authorize-attempt tx: sequence row `FOR SHARE`, verify `status='active' AND generation=?` against the fence identity carried in the workflow's trusted execution context (sequence key + generation from the recorded claim-step output, threaded through the effect Intent by framework workflow code — never caller-supplied free text); non-sequence effects skip the fence (no row) | authorize tx (§4/CR-03) | fence identity bound to tenant + invocation | refusal → `effect-refused/superseded` | supersede-first → old generation cannot authorize another attempt; attempt-first → in flight, reported honestly; in-flight provider work at supersede time cannot be recalled (recorded, not described as cooperative cancellation) | same barrier test; reusable framework primitive — future Class D miniapps inherit it via `Perform`, never reimplement |
 | Attach re-resolve | target terminal + newer live generation | re-attached | Status/attach read resolves current live generation | read | tenant match | — | no live generation → report target outcome | `TestProbeAttachLifecycle` (X-08) |
 
+P24-004 owner disposition (explicit scope deferral, not an
+implemented guarantee): the Generation-fence row above is
+PROBE-SCOPED — no verifier implementation, no trusted identity
+propagation, and no authorization-time generation validation
+exist today (named limitation; sequence effects remain
+mock-only). Activation trigger (explicit and enforceable): a
+miniapp manifest declaring sequence-bound effects (the
+framework-declared sequence-requirement marker in
+tool/workload configuration — never inferred from
+caller-supplied `Intent.Sequence` presence) submitted for
+registry admission is REFUSED until verifier + trusted
+propagation (framework-originated, tenant/invocation/effect
+bound) + supersede validation + the X-08 barrier test all
+land. When active, missing identity/verifier fails closed at
+lock-order position 3 with no new transaction, I/O, or
+advisory lock.
+
 ### M6 — Cancellation (`runtime` + effects)
 
 | Event | Source | Dest | Predicate / lock | Atomicity | Auth | Audit | Failure exit → recovery | Test |
@@ -530,13 +559,14 @@ predicates; RLS stays defense in depth.
 Run-less records (`pending`, Class A pre-completion) carry no
 `run_id` and cannot be addressed by the `run_id`-keyed Cancel API
 (P20 INFO-7 — intended: nothing is running to stop).
-Effective-trust rule: authorization evaluates the requested trust
-within grant on every entry, so a confirm→autonomous retry floats
-past the approval requirement on the Class A path (executes
-without linkage) while the Class D choke refuses it
-(`errApprovalRequired`, fail-closed); both directions are
-grant-capped (no privilege escalation). Specified behavior, not a
-defect; Phase 2 treats it as such.
+Effective-trust rule (unparked records only — P21-004: waiting
+records poll their approval and never float): authorization
+evaluates the requested trust within grant on every entry, so a
+confirm→autonomous retry floats past the approval requirement on
+the Class A path (executes without linkage) while the Class D
+choke refuses it (`errApprovalRequired`, fail-closed); both
+directions are grant-capped (no privilege escalation). Specified
+behavior, not a defect; Phase 2 treats it as such.
 
 ### Owner Decision — Cancellation of an Attached Invocation (ACCEPTED)
 
@@ -578,13 +608,15 @@ preserved, idempotency, cross-tenant refusal, owner behavior unchanged.
   `live` (operation term, P20 INFO-1): `pending, running,
   waiting_approval, waiting_event` — nonterminal minus
   `quarantined`. Operation-specific exclusions (all verified in
-  implementation): `cancelIfLive`/`syncIfLive` exclude `pending`
-  (pending records carry no runs; Cancel/Status address by run);
+  implementation): `cancelIfLive`/`syncIfLive`/`checkLive`
+  exclude `pending` (pending records carry no runs — enforced
+  structurally: adoption atomically marks pending→running, so
+  the exclusion can never strand a submitted workflow; P21-002);
   `completeIfLive`/`completeTx` include `pending` (undispatched
   Class A must complete); `failIfWaiting` is waiting-only (poll
-  settlement); `adoptRunID` takes all four live states
-  (restoration adopts from `pending`). Terminal/quarantined are
-  excluded everywhere.
+  settlement); `adoptRunID` takes all four live states and marks
+  pending→running on win (restoration adopts from `pending`).
+  Terminal/quarantined are excluded everywhere.
 - **M2 approval.** Terminal: `decided, expired, cancelled`.
   Invariants: a decision is never substituted after the first
   terminal decision (identical re-decide is idempotent, never a
@@ -1048,6 +1080,8 @@ source file was modified; only this document and evidence changed.
 | P20 MEDIUM-2 | Class A single execution: advisory xact claim + single-tx handler/completion + savepoint handler-error semantics + execution-in-progress conflict | Concurrent granted polls / duplicate dispatches double-executed handlers; crash-after-handler-commit double-applied on recovery | §4, §5 | T1/T2/C1/C2/C3/C4/T5/T6 (new) + HIGH-1/M-01/full-suite regressions | non-transactional handler side effects stay outside the guarantee (ledger boundary); post-commit audit still needs X-12 backfill |
 | P20 MEDIUM-2 §4 | No-cycle proof extended to two ordered advisories (claim→entity, single site, try-claim never waits) + savepoint-claim survival | Second advisory lock added by the execution claim | §4 | entity serialization suites + claim contention tests | none |
 | P20 MEDIUM-3 | prompt17:144 + plan-review mirror corrected: §4 authoritative, advisory-last struck, authorizeAttempt takes no advisory lock, outermost-first preserved | Binding work order contradicted corrected §4 (deadlock-prone direction + inapplicable lock) | prompt17.md, prompt17_plan_review.md | repo-wide grep: no advisory-last instructions remain in governing docs (historical reviews/writeups describing the contradiction preserved as records, listed in evidence) | none |
+| P22 P21-002 | Pending semantics fixed structurally: adoption marks pending→running atomically; pending ⟹ unsubmitted, so checkLive/cancelIfLive/syncIfLive keep excluding pending and authorizeAttempt treats pending as ineligible | Specified stuck state (pending+workflow) proven unreachable — approval gate refuses pre-linkage submits, park atomicity couples approval to waiting — but the invariant was argument-only | §4.2, CR-05/INFO-1 (+checkLive listed) | adoption-flip red/green + 4 fail-closed characterization suites + full-suite regressions | none; Class A pending (never adopts) untouched by construction |
+| P25 Gate-1 corrections | P24-001 commit-on-decision withdrawal with same-tx paired audit; P24-002 attempt-fenced outcome transitions; P24-003 lock-free Settle attribution (§4.2 "5 only" now true); P24-005 option (a) autonomous exception + independent trust-modes admission; P24-004 M5 probe-scoped deferral + enforceable activation trigger; P24-007 claim-time framework minting; P24-008 capability-membership prerequisite; P24-009 AST policy guard; P24-010 state-qualified contention hint; P24-011 phantom-binding terminal taxonomy | Gate 1 review (adv_review_prompt24) found 2 HIGH + 1 lock-order + 2 dispositions + 6 LOW/INFO against the Stage 3A authorization core | §4.2 Settle row, §7/M3 Authorize/Withdraw/Send rows, §7/M5, §7/M3 P24-008 prerequisite, §16 | `TestP25POC1*`, `TestP25TerminalWithdraw*`, `TestP25POC2*`, `TestP25Settle*`, `TestP25M1–M7`, `TestP25Mint*`, `TestP25Contention*`, `TestP25NoRows*`, `TestP23GuardNegativeControl` (all red/green or guard-pinned per finding) | empty-TrustModes manifests keep legacy demand-linkage (declare modes for coherence); mint-failure branch defensive (unforceable); pure map aliasing beyond the AST guard (documented) |
 
 No new architectural conflicts discovered. No owner decision
 invented. OpenCode remains NOT RUN/BLOCKED (unchanged, non-blocking).

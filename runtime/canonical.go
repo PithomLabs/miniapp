@@ -3,19 +3,14 @@ package runtime
 import (
 	"bytes"
 	"encoding/json"
+
+	"github.com/PithomLabs/miniapp/contract"
 )
 
-// canonicalJSON normalizes a JSON document so semantically identical
-// inputs compare equal regardless of whitespace or key order.
-// encoding/json emits map keys sorted, which makes the re-marshaled
-// form canonical for comparison and hashing.
+// canonicalJSON delegates to the shared contract implementation
+// (single definition; this wrapper preserves existing call sites).
 func canonicalJSON(raw json.RawMessage) ([]byte, error) {
-	var v any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	if err := dec.Decode(&v); err != nil {
-		return nil, err
-	}
-	return json.Marshal(v)
+	return contract.CanonicalJSON(raw)
 }
 
 // sameInput reports whether two inputs are semantically identical.

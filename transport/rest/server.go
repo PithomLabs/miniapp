@@ -101,7 +101,7 @@ func statusFor(re *runtime.Error) int {
 		return http.StatusForbidden
 	case "unknown-miniapp", "unknown-tool", "unknown-invocation", "unknown-run", "unknown-approval":
 		return http.StatusNotFound
-	case "idempotency-key-reuse", "execution-in-progress":
+	case "idempotency-key-reuse", "execution-in-progress", "effect-contention":
 		return http.StatusConflict
 	default:
 		return http.StatusBadRequest

@@ -45,20 +45,20 @@ const (
 	probeGatedTool = "probe.gated"
 )
 
-func testPolicy() auth.Policy {
+func testPolicy() *auth.Policy {
 	binding := func(agent, tenant string, roles ...string) auth.Binding {
 		return auth.Binding{AgentID: agent, Authority: contract.Authority{
 			Kind: contract.AuthorityUser, ID: agent, TenantID: tenant,
 		}, Roles: roles}
 	}
-	return auth.Policy{
-		Keys: map[string]auth.Binding{
+	return auth.NewPolicy(
+		map[string]auth.Binding{
 			credAgentA:  binding("agent-a", tenantA),
 			credAgentA2: binding("agent-a2", tenantA),
 			credAgentB:  binding("agent-b", tenantB),
 			credDecide:  binding("human-op", tenantA, "tenant-ops"),
 		},
-		Grants: map[string]map[string]contract.TrustMode{
+		map[string]map[string]contract.TrustMode{
 			tenantA: {
 				crmread.ID:     contract.TrustAutonomous,
 				gatedID:        contract.TrustConfirm,
@@ -68,7 +68,7 @@ func testPolicy() auth.Policy {
 			},
 			tenantB: {crmread.ID: contract.TrustAutonomous, "entity-probe": contract.TrustAutonomous},
 		},
-	}
+	)
 }
 
 // fakeAsync is a deterministic stand-in for the DBOS executor. It
@@ -164,7 +164,7 @@ type fixture struct {
 	async    *fakeAsync
 	approver *approvals.Service
 	effects  *effects.Service
-	policy   auth.Policy
+	policy   *auth.Policy
 	reg      *registry.Registry
 	captured *captureStore
 }
@@ -224,6 +224,7 @@ func newFixture(t *testing.T, db *testkit.DB) fixture {
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
 		Canceller: runtime.EffectCanceller(db.Pool),
 		Policy:    effects.StrictPolicy{Pool: db.Pool, Registry: reg, Grants: policy},
+		Registry:  reg, Grants: policy, Approver: approver, Auditor: aud,
 	})
 	svc, err := runtime.New(runtime.Config{
 		Registry: reg,
@@ -774,6 +775,7 @@ func TestCancelInFlightReported(t *testing.T) {
 		Channels:  map[string]effects.Channel{"mock": gate},
 		Canceller: runtime.EffectCanceller(db.Pool),
 		Policy:    effects.StrictPolicy{Pool: db.Pool, Registry: fx.reg, Grants: fx.policy},
+		Registry:  fx.reg, Grants: fx.policy, Approver: fx.approver, Auditor: fx.aud,
 	})
 	flightTok := effectToken(t, db, tenantA, out.InvocationID)
 	done := make(chan error, 1)
@@ -1066,7 +1068,17 @@ func TestEffectGrantRevoked(t *testing.T) {
 		t.Fatalf("invoke: %v", err)
 	}
 	tok := effectToken(t, db, tenantA, out.InvocationID)
-	delete(fx.policy.Grants[tenantA], probeID)
+	// Revoke via the setter API (§4.1): rebuild tenant grants
+	// without the probe miniapp; direct map mutation is forbidden.
+	fx.policy.SetGrants(map[string]map[string]contract.TrustMode{
+		tenantA: {
+			crmread.ID:     contract.TrustAutonomous,
+			gatedID:        contract.TrustConfirm,
+			probeGatedID:   contract.TrustConfirm,
+			"entity-probe": contract.TrustAutonomous,
+		},
+		tenantB: {crmread.ID: contract.TrustAutonomous, "entity-probe": contract.TrustAutonomous},
+	})
 	_, err = fx.effects.Perform(context.Background(), tenantA, effIntent(out.InvocationID, tok, "op-revoked", mockcap.ModeAccept))
 	if err == nil || !strings.Contains(err.Error(), "no live grant") {
 		t.Fatalf("revoked-grant claim err = %v, want refusal", err)

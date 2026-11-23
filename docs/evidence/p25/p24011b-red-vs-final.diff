@@ -1,0 +1,12 @@
+--- /tmp/p25_red11/effects/effects.go	2026-11-23 22:28:04.447160511 +0800
++++ effects/effects.go	2026-11-23 22:27:52.554630991 +0800
+@@ -688,6 +688,9 @@
+ func (s *Service) insertSettleAudit(ctx context.Context, tx pgx.Tx, tenantID string, rec contract.EffectRecord, outcome contract.EffectState, note, operator string) error {
+ 	miniapp, version, tool, err := loadIdentityTx(ctx, tx, tenantID, rec.InvocationID)
+ 	if err != nil {
++		if isNoRows(err) {
++			return ErrPhantomBinding
++		}
+ 		return fmt.Errorf("effects: cannot attribute settlement: %w", err)
+ 	}
+ 	details, _ := json.Marshal(map[string]any{

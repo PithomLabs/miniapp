@@ -8,13 +8,17 @@ import (
 
 func TestEffectTransitions(t *testing.T) {
 	r := &EffectRecord{BusinessOpID: "t:1", AttemptID: "a1", State: EffectPending}
-	for _, next := range []EffectState{EffectAttempting, EffectUnknown, EffectReconciling, EffectConfirmed} {
+	for _, next := range []EffectState{EffectAttempting, EffectUnknown, EffectConfirmed} {
 		if err := r.Transition(next); err != nil {
 			t.Fatalf("transition to %s rejected: %v", next, err)
 		}
 	}
 	if r.State != EffectConfirmed {
 		t.Fatalf("expected CONFIRMED, got %s", r.State)
+	}
+	r2 := &EffectRecord{BusinessOpID: "t:1", AttemptID: "a1", State: EffectUnknown}
+	if err := r2.Transition(EffectReconciling); err == nil {
+		t.Fatal("UNKNOWN -> RECONCILING accepted; the intermediate state is retired")
 	}
 }
 

@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,7 +60,7 @@ type InvokeResult struct {
 // closed on any nil so a half-wired service cannot serve.
 type Config struct {
 	Registry *registry.Registry
-	Policy   auth.Policy
+	Policy   *auth.Policy
 	Pool     *pgxpool.Pool
 	Sync     executor.SyncExecutor
 	Async    executor.AsyncExecutor
@@ -92,18 +91,11 @@ func New(cfg Config) (*Service, error) {
 	return &Service{cfg: cfg, store: &invocations{pool: cfg.Pool}, validator: newValidator()}, nil
 }
 
-// IntentHash binds an operation to its exact arguments. Agents and
-// deciders recompute it identically; any material change produces a
-// different hash and invalidates outstanding approvals. Input is
-// canonicalized first so insignificant serialization differences
-// (whitespace, key order) never invalidate an approval.
+// IntentHash delegates to the shared contract implementation
+// (single definition; this wrapper preserves existing call sites,
+// including frozen regression tests).
 func IntentHash(miniapp, version, tool string, input json.RawMessage) contract.Digest {
-	canonical, err := canonicalJSON(input)
-	if err != nil {
-		canonical = input
-	}
-	sum := sha256.Sum256([]byte(miniapp + "\x00" + version + "\x00" + tool + "\x00" + string(canonical)))
-	return contract.Digest(fmt.Sprintf("sha256:%x", sum))
+	return contract.IntentHash(miniapp, version, tool, input)
 }
 
 // Invoke executes one governed invocation: validate, authenticate,
@@ -655,6 +647,20 @@ func (s *Service) confirmSubmit(ctx context.Context, req InvokeRequest, binding 
 	return InvokeResult{InvocationID: rec.ID, Status: rec.Status, Handle: &handle}, nil
 }
 
+// contentionRetryHint qualifies the effect-contention retry
+// instruction by record state and tool class, following replay
+// semantics: running Class A records answer interrupted/new-key,
+// so same-key retry cannot converge there; every other live
+// shape converges via same-key replay. Used only by the
+// effect-contention mapping; the execution-in-progress message
+// is unchanged (out of scope for P24-010).
+func contentionRetryHint(status contract.RunStatus, class contract.Class) string {
+	if class == contract.ClassA && (status == contract.RunRunning || status == contract.RunWaitingEvent) {
+		return "resubmit with a new idempotency key (running Class A records answer interrupted/new-key per replay semantics)"
+	}
+	return "retry with the same idempotency key"
+}
+
 // toolFor resolves the admitted tool for a request. The choke
 // point uses it to derive approval requirements from trusted
 // registry state, never from caller input.
@@ -701,6 +707,15 @@ func (s *Service) executeSync(ctx context.Context, req InvokeRequest, binding au
 		// claim is still held) and no automatic retry loop.
 		return InvokeResult{}, terminal("execution-in-progress",
 			"another execution holds invocation %s; retry with the same idempotency key", rec.ID)
+	}
+	if errors.Is(err, executor.ErrAttemptContention) {
+		// Ledger contention inside the handler: the attempt
+		// rolled back with nothing committed (no FAILED
+		// recorded). Terminal conflict; the retry instruction
+		// follows replay semantics for this record (C6).
+		return InvokeResult{}, terminal("effect-contention",
+			"another attempt owns the effect for invocation %s; %s", rec.ID,
+			contentionRetryHint(rec.Status, tool.Class))
 	}
 	if errors.Is(err, executor.ErrExecutionSuperseded) {
 		// Rolled back before committing anything: reload and

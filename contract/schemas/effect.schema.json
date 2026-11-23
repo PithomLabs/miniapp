@@ -32,6 +32,9 @@
         "updatedAt": {
           "type": "string",
           "format": "date-time"
+        },
+        "invocationId": {
+          "type": "string"
         }
       },
       "additionalProperties": false,

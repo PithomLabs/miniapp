@@ -105,43 +105,43 @@ type keyFileEntry struct {
 	Roles  []string `json:"roles"`
 }
 
-func loadPolicy() (auth.Policy, error) {
+func loadPolicy() (*auth.Policy, error) {
 	keysPath := os.Getenv("MINIAPP_KEYS_FILE")
 	grantsPath := os.Getenv("MINIAPP_GRANTS_FILE")
 	if keysPath == "" || grantsPath == "" {
-		return auth.Policy{}, fmt.Errorf("MINIAPP_KEYS_FILE and MINIAPP_GRANTS_FILE are required")
+		return nil, fmt.Errorf("MINIAPP_KEYS_FILE and MINIAPP_GRANTS_FILE are required")
 	}
 	keysRaw, err := os.ReadFile(keysPath)
 	if err != nil {
-		return auth.Policy{}, fmt.Errorf("keys file: %w", err)
+		return nil, fmt.Errorf("keys file: %w", err)
 	}
 	var keys map[string]keyFileEntry
 	if err := json.Unmarshal(keysRaw, &keys); err != nil {
-		return auth.Policy{}, fmt.Errorf("keys file: %w", err)
+		return nil, fmt.Errorf("keys file: %w", err)
 	}
 	grantsRaw, err := os.ReadFile(grantsPath)
 	if err != nil {
-		return auth.Policy{}, fmt.Errorf("grants file: %w", err)
+		return nil, fmt.Errorf("grants file: %w", err)
 	}
 	var grants map[string]map[string]contract.TrustMode
 	if err := json.Unmarshal(grantsRaw, &grants); err != nil {
-		return auth.Policy{}, fmt.Errorf("grants file: %w", err)
+		return nil, fmt.Errorf("grants file: %w", err)
 	}
-	policy := auth.Policy{Keys: map[string]auth.Binding{}, Grants: grants}
+	bindings := map[string]auth.Binding{}
 	for cred, e := range keys {
 		if cred == "" || e.Agent == "" || e.Tenant == "" {
-			return auth.Policy{}, fmt.Errorf("keys file: credential, agent, and tenant are all required")
+			return nil, fmt.Errorf("keys file: credential, agent, and tenant are all required")
 		}
-		policy.Keys[cred] = auth.Binding{AgentID: e.Agent, Authority: contract.Authority{
+		bindings[cred] = auth.Binding{AgentID: e.Agent, Authority: contract.Authority{
 			Kind: contract.AuthorityKind(e.Kind), ID: e.ID, TenantID: e.Tenant,
 		}, Roles: e.Roles}
 	}
+	policy := auth.NewPolicy(bindings, grants)
 	// Fail closed on unusable bindings before serving anything.
-	for cred, b := range policy.Keys {
+	for cred := range keys {
 		if _, err := policy.Authenticate(cred); err != nil {
-			return auth.Policy{}, fmt.Errorf("keys file: %w", err)
+			return nil, fmt.Errorf("keys file: %w", err)
 		}
-		_ = b
 	}
 	return policy, nil
 }
@@ -177,16 +177,19 @@ func buildService(ctx context.Context, logger *slog.Logger) (*wired, error) {
 		pool.Close()
 		return nil, err
 	}
+	approver := approvals.New(pool)
+	auditor := audit.New(pool, logger)
 	eff := effects.New(effects.Config{Pool: pool,
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(pool)},
 		Canceller: runtime.EffectCanceller(pool),
 		Policy:    effects.StrictPolicy{Pool: pool, Registry: reg, Grants: policy},
+		Registry:  reg, Grants: policy, Approver: approver, Auditor: auditor,
 	})
 	classd.Effects = eff
 	svc, err := runtime.New(runtime.Config{
 		Registry: reg, Policy: policy, Pool: pool,
 		Sync: classa.New(pool, reg), Async: ex,
-		Approver: approvals.New(pool), Auditor: audit.New(pool, logger), Effects: eff,
+		Approver: approver, Auditor: auditor, Effects: eff,
 	})
 	if err != nil {
 		_ = ex.Shutdown(10 * time.Second)

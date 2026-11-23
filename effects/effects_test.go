@@ -2,14 +2,20 @@ package effects
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/PithomLabs/miniapp/approvals"
+	"github.com/PithomLabs/miniapp/audit"
+	"github.com/PithomLabs/miniapp/auth"
 	"github.com/PithomLabs/miniapp/contract"
 	"github.com/PithomLabs/miniapp/internal/store"
+	"github.com/PithomLabs/miniapp/registry"
 	"github.com/PithomLabs/miniapp/testkit"
 )
 
@@ -50,19 +56,57 @@ func (allowPolicy) CheckPolicy(ctx context.Context, tenantID string, intent Inte
 	return nil
 }
 
-func setup(t *testing.T, ch Channel) (*Service, string) {
+func setup(t *testing.T, ch Channel) (*Service, string, *testkit.DB) {
 	t.Helper()
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
-	return New(Config{Pool: db.Pool, Channels: map[string]Channel{"mock": ch}, Canceller: allowCancellation{}, Policy: allowPolicy{}}), "t-effect"
+	db.Truncate(t, "app.effect_records", "app.invocations", "app.audit_events")
+	reg := registry.New()
+	testkit.RegisterClassATool(t, reg, "t-auth-fix", "t.auth", "", nil,
+		func(ctx context.Context, call registry.ToolCall) (json.RawMessage, error) {
+			return json.RawMessage(`{}`), nil
+		})
+	grants := map[string]map[string]contract.TrustMode{}
+	for _, tenant := range []string{"t-effect", "t-ws", "t-a", "t-b", "tenant-a", "tenant-b"} {
+		grants[tenant] = map[string]contract.TrustMode{"t-auth-fix": contract.TrustAutonomous}
+	}
+	svc := New(Config{Pool: db.Pool, Channels: map[string]Channel{"mock": ch},
+		Canceller: allowCancellation{}, Policy: allowPolicy{},
+		Registry: reg, Grants: auth.NewPolicy(map[string]auth.Binding{}, grants),
+		Approver: approvals.New(db.Pool), Auditor: audit.New(db.Pool, nil)})
+	return svc, "t-effect", db
+}
+
+// authzInvID deterministically maps a test-local invocation name to
+// the UUID primary key authorization looks up.
+func authzInvID(tenant, local string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(tenant+"\x00"+local)).String()
+}
+
+// seedLiveInvocation inserts a running invocation row the fixture
+// tool owns, addressable as authzInvID(tenant, local). Intents
+// must carry that ID plus tok-authz-fixture.
+func seedLiveInvocation(t *testing.T, db *testkit.DB, tenant, local string) {
+	t.Helper()
+	_, err := store.WithTenant(context.Background(), db.Pool, tenant, func(tx pgx.Tx) (bool, error) {
+		_, err := tx.Exec(context.Background(), `INSERT INTO app.invocations
+			(id, tenant_id, miniapp_id, miniapp_version, tool, idempotency_key, input,
+			 status, trust_mode, effect_token)
+			VALUES ($1, $2, 't-auth-fix', '1.0.0', 't.auth', $3, '{}', 'running', 'autonomous', 'tok-authz-fixture')`,
+			authzInvID(tenant, local), tenant, "key-"+local)
+		return true, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPerformHappyPath(t *testing.T) {
 	ch := &scriptChannel{steps: []func() (Receipt, error){okStep("req-1")}}
-	svc, tenant := setup(t, ch)
+	svc, tenant, db := setup(t, ch)
+	seedLiveInvocation(t, db, tenant, "inv-test")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	rec, err := svc.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-happy", InvocationID: "inv-test", AttemptID: "a1", Operation: Operation{CapabilityID: "mock", Operation: "send"}})
+	rec, err := svc.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-happy", InvocationID: authzInvID("t-effect", "inv-test"), AttemptID: "a1", EffectToken: "tok-authz-fixture", Operation: Operation{CapabilityID: "mock", Operation: "send"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +117,7 @@ func TestPerformHappyPath(t *testing.T) {
 		t.Fatalf("provider contacted %d times, want 1", ch.sends)
 	}
 	// Repeating the same operation must not re-send.
-	rec2, err := svc.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-happy", InvocationID: "inv-test", AttemptID: "a2", Operation: Operation{CapabilityID: "mock", Operation: "send"}})
+	rec2, err := svc.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-happy", InvocationID: authzInvID("t-effect", "inv-test"), AttemptID: "a2", EffectToken: "tok-authz-fixture", Operation: Operation{CapabilityID: "mock", Operation: "send"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,8 +132,9 @@ func TestPerformFailureAndUnknown(t *testing.T) {
 	failCh := &scriptChannel{steps: []func() (Receipt, error){
 		func() (Receipt, error) { return Receipt{}, PermanentError{errors.New("rejected")} },
 	}}
-	svc, tenant := setup(t, failCh)
-	rec, err := svc.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-fail", InvocationID: "inv-test", AttemptID: "a1", Operation: Operation{CapabilityID: "mock"}})
+	svc, tenant, db := setup(t, failCh)
+	seedLiveInvocation(t, db, tenant, "inv-test")
+	rec, err := svc.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-fail", InvocationID: authzInvID("t-effect", "inv-test"), AttemptID: "a1", EffectToken: "tok-authz-fixture", Operation: Operation{CapabilityID: "mock"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,8 +145,9 @@ func TestPerformFailureAndUnknown(t *testing.T) {
 	timeoutCh := &scriptChannel{steps: []func() (Receipt, error){
 		func() (Receipt, error) { return Receipt{}, UnknownError{errors.New("timeout after send")} },
 	}}
-	svc2, _ := setup(t, timeoutCh)
-	rec2, err := svc2.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-unknown", InvocationID: "inv-test", AttemptID: "a1", Operation: Operation{CapabilityID: "mock"}})
+	svc2, _, db2 := setup(t, timeoutCh)
+	seedLiveInvocation(t, db2, tenant, "inv-test")
+	rec2, err := svc2.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-unknown", InvocationID: authzInvID("t-effect", "inv-test"), AttemptID: "a1", EffectToken: "tok-authz-fixture", Operation: Operation{CapabilityID: "mock"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +155,7 @@ func TestPerformFailureAndUnknown(t *testing.T) {
 		t.Fatalf("state = %s, want UNKNOWN", rec2.State)
 	}
 	// Unknown outcomes never blind-retry on repeat.
-	if _, err := svc2.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-unknown", InvocationID: "inv-test", AttemptID: "a2", Operation: Operation{CapabilityID: "mock"}}); err != nil {
+	if _, err := svc2.Perform(ctx, tenant, Intent{BusinessOpID: "t-effect:op-unknown", InvocationID: authzInvID("t-effect", "inv-test"), AttemptID: "a2", EffectToken: "tok-authz-fixture", Operation: Operation{CapabilityID: "mock"}}); err != nil {
 		t.Fatal(err)
 	}
 	if timeoutCh.sends != 1 {
@@ -134,7 +180,7 @@ func TestPerformAdoptsStrandedAttempt(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := svc.Perform(ctx, "t-effect", Intent{BusinessOpID: "t-effect:op-crash", InvocationID: "inv-test", AttemptID: "a2", Operation: Operation{CapabilityID: "mock", Operation: "send"}})
+	rec, err := svc.Perform(ctx, "t-effect", Intent{BusinessOpID: "t-effect:op-crash", InvocationID: authzInvID("t-effect", "inv-test"), AttemptID: "a2", Operation: Operation{CapabilityID: "mock", Operation: "send"}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -79,6 +79,7 @@ func TestFaultEffectReserve(t *testing.T) {
 	inj.FailAt("effect-reserve", 1, errFault)
 	svc.TestFault = inj
 	ctx := context.Background()
+	seedLiveInvocation(t, db, wsTenant, "inv-op-freserve")
 	intent := mockIntent("op-freserve", mockcap.ModeAccept)
 
 	if _, err := svc.Perform(ctx, wsTenant, intent); !errors.Is(err, errFault) {
@@ -106,6 +107,7 @@ func TestFaultAttemptBegin(t *testing.T) {
 	inj.FailAt("attempt-begin", 1, errFault)
 	svc.TestFault = inj
 	ctx := context.Background()
+	seedLiveInvocation(t, db, wsTenant, "inv-op-fattempt")
 	intent := mockIntent("op-fattempt", mockcap.ModeAccept)
 
 	if _, err := svc.Perform(ctx, wsTenant, intent); !errors.Is(err, errFault) {
@@ -148,11 +150,12 @@ func TestFaultAttemptBegin(t *testing.T) {
 func TestFaultTakeoverBegin(t *testing.T) {
 	svc, db := setupMock(t)
 	ctx := context.Background()
+	seedLiveInvocation(t, db, wsTenant, "inv-op-ftake")
 	_, err := store.WithTenant(ctx, db.Pool, wsTenant, func(tx pgx.Tx) (bool, error) {
 		_, err := tx.Exec(ctx, `INSERT INTO app.effect_records
-			(business_op_id, tenant_id, attempt_id, capability_id, operation, payload, state, updated_at)
-			VALUES ($1, $2, 'a0', 'mock', 'send', '{"mock":{"mode":"accept","opId":"op-ftake"}}', 'PENDING', now() - interval '1 hour')`,
-			wsTenant+":op-ftake", wsTenant)
+			(business_op_id, tenant_id, attempt_id, invocation_id, capability_id, operation, payload, state, updated_at)
+			VALUES ($1, $2, 'a0', $3, 'mock', 'send', '{"mock":{"mode":"accept","opId":"op-ftake"}}', 'PENDING', now() - interval '1 hour')`,
+			wsTenant+":op-ftake", wsTenant, authzInvID(wsTenant, "inv-op-ftake"))
 		return true, err
 	})
 	if err != nil {
@@ -183,6 +186,7 @@ func TestFaultSettleCommit(t *testing.T) {
 	inj.FailAt("settle-commit", 1, errFault)
 	svc.TestFault = inj
 	ctx := context.Background()
+	seedLiveInvocation(t, db, wsTenant, "inv-op-fsettle")
 	intent := mockIntent("op-fsettle", mockcap.ModeAccept)
 
 	if _, err := svc.Perform(ctx, wsTenant, intent); !errors.Is(err, errFault) {
@@ -214,6 +218,7 @@ func TestFaultSettleResponse(t *testing.T) {
 	inj.FailAt("settle-response", 1, errFault)
 	svc.TestFault = inj
 	ctx := context.Background()
+	seedLiveInvocation(t, db, wsTenant, "inv-op-fresp")
 	intent := mockIntent("op-fresp", mockcap.ModeAccept)
 
 	if _, err := svc.Perform(ctx, wsTenant, intent); !errors.Is(err, errFault) {
@@ -236,6 +241,7 @@ func TestFaultSettleResponse(t *testing.T) {
 // its transition → error, row stays UNKNOWN; retry converges.
 func TestFaultSettleOperatorCommit(t *testing.T) {
 	svc, db := setupMock(t)
+	seedLiveInvocation(t, db, wsTenant, "inv-op-fopsettle")
 	ctx := context.Background()
 	if rec, err := svc.Perform(ctx, wsTenant, mockIntent("op-fopsettle", mockcap.ModeLostAck)); err != nil || rec.State != contract.EffectUnknown {
 		t.Fatalf("lost-ack setup = %+v, %v; want UNKNOWN", rec, err)
@@ -244,14 +250,14 @@ func TestFaultSettleOperatorCommit(t *testing.T) {
 	inj.FailAt("settle-operator-commit", 1, errFault)
 	svc.TestFault = inj
 
-	if _, err := svc.Settle(ctx, wsTenant, wsTenant+":op-fopsettle", contract.EffectFailed, "evidence"); !errors.Is(err, errFault) {
+	if _, err := svc.Settle(ctx, wsTenant, wsTenant+":op-fopsettle", contract.EffectFailed, "evidence", "test-operator"); !errors.Is(err, errFault) {
 		t.Fatalf("Settle err = %v, want injected fault", err)
 	}
 	st, _ := effectState(t, db, wsTenant, wsTenant+":op-fopsettle")
 	if st != contract.EffectUnknown {
 		t.Fatalf("state = %s, want UNKNOWN (settlement rolled back)", st)
 	}
-	rec, err := svc.Settle(ctx, wsTenant, wsTenant+":op-fopsettle", contract.EffectFailed, "evidence")
+	rec, err := svc.Settle(ctx, wsTenant, wsTenant+":op-fopsettle", contract.EffectFailed, "evidence", "test-operator")
 	if err != nil || rec.State != contract.EffectFailed {
 		t.Fatalf("retry = %+v, %v; want FAILED", rec, err)
 	}
@@ -262,14 +268,15 @@ func TestFaultSettleOperatorCommit(t *testing.T) {
 // settles FAILED, the honest lifecycle outcome for a failed call.
 func TestFaultProviderSend(t *testing.T) {
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
+	truncateLedger(t, db)
 	mockcap.EnsureLog(t, db.Pool)
 	mockcap.TruncateLog(t, db.Pool)
 	inj := fault.New()
 	inj.FailAt(faultwrap.OpProviderSend, 1, errFault)
-	svc := effects.New(effects.Config{Pool: db.Pool,
-		Channels:  map[string]effects.Channel{"mock": faultwrap.Channel{Inner: mockcap.New(db.Pool), Inj: inj}},
-		Canceller: allowCancellation{}, Policy: allowPolicy{}})
+	svc := newAuthService(t, db,
+		map[string]effects.Channel{"mock": faultwrap.Channel{Inner: mockcap.New(db.Pool), Inj: inj}},
+		allowCancellation{}, allowPolicy{})
+	seedLiveInvocation(t, db, wsTenant, "inv-op-fsend")
 	ctx := context.Background()
 
 	rec, err := svc.Perform(ctx, wsTenant, mockIntent("op-fsend", mockcap.ModeAccept))
@@ -291,14 +298,14 @@ func TestFaultProviderSend(t *testing.T) {
 // refused before any reservation; no row, no send.
 func TestFaultPolicyCheck(t *testing.T) {
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
+	truncateLedger(t, db)
 	mockcap.EnsureLog(t, db.Pool)
 	mockcap.TruncateLog(t, db.Pool)
 	inj := fault.New()
 	inj.FailAt(faultwrap.OpPolicyCheck, 1, errFault)
-	svc := effects.New(effects.Config{Pool: db.Pool,
-		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
-		Canceller: allowCancellation{}, Policy: faultwrap.Policy{Inner: allowPolicy{}, Inj: inj}})
+	svc := newAuthService(t, db,
+		map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
+		allowCancellation{}, faultwrap.Policy{Inner: allowPolicy{}, Inj: inj})
 	ctx := context.Background()
 
 	if _, err := svc.Perform(ctx, wsTenant, mockIntent("op-fpolicy", mockcap.ModeAccept)); !errors.Is(err, errFault) {

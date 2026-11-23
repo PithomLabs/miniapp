@@ -99,6 +99,7 @@ func newRedFixture(t *testing.T, db *testkit.DB) redFixture {
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
 		Canceller: runtime.EffectCanceller(db.Pool),
 		Policy:    effects.StrictPolicy{Pool: db.Pool, Registry: reg, Grants: policy},
+		Registry:  reg, Grants: policy, Approver: approver, Auditor: aud,
 	})
 	svc, err := runtime.New(runtime.Config{
 		Registry: reg, Policy: policy, Pool: db.Pool,

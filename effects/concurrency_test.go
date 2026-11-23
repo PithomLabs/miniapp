@@ -34,10 +34,10 @@ func (allowPolicy) CheckPolicy(ctx context.Context, tenantID string, intent effe
 func setupMock(t *testing.T) (*effects.Service, *testkit.DB) {
 	t.Helper()
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
+	truncateLedger(t, db)
 	mockcap.EnsureLog(t, db.Pool)
 	mockcap.TruncateLog(t, db.Pool)
-	return effects.New(effects.Config{Pool: db.Pool, Channels: map[string]effects.Channel{"mock": mockcap.New(db.Pool)}, Canceller: allowCancellation{}, Policy: allowPolicy{}}), db
+	return newAuthService(t, db, map[string]effects.Channel{"mock": mockcap.New(db.Pool)}, allowCancellation{}, allowPolicy{}), db
 }
 
 func mockPayload(mode, opID string) json.RawMessage {
@@ -46,7 +46,8 @@ func mockPayload(mode, opID string) json.RawMessage {
 
 func mockIntent(opID, mode string) effects.Intent {
 	return effects.Intent{
-		BusinessOpID: wsTenant + ":" + opID, AttemptID: "a-" + opID, InvocationID: "inv-" + opID,
+		BusinessOpID: wsTenant + ":" + opID, AttemptID: "a-" + opID, InvocationID: authzInvID(wsTenant, "inv-"+opID),
+		EffectToken: authzToken,
 		Operation: effects.Operation{CapabilityID: "mock", Operation: "send",
 			Payload: mockPayload(mode, opID)},
 	}
@@ -73,15 +74,14 @@ func TestOpIDScopeEnforced(t *testing.T) {
 // so the verdict never depends on scheduling skew.
 func TestConcurrentDuplicateClaims(t *testing.T) {
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
+	truncateLedger(t, db)
 	gate := &gateChannel{entered: make(chan struct{}), release: make(chan struct{})}
-	svc := effects.New(effects.Config{Pool: db.Pool,
-		Channels:  map[string]effects.Channel{"mock": gate},
-		Canceller: allowCancellation{}, Policy: allowPolicy{}})
+	svc := newAuthService(t, db, map[string]effects.Channel{"mock": gate}, allowCancellation{}, allowPolicy{})
+	seedLiveInvocation(t, db, wsTenant, "inv-race")
 	ctx := context.Background()
 	intent := effects.Intent{BusinessOpID: wsTenant + ":op-race", AttemptID: "a1",
-		InvocationID: "inv-race",
-		Operation:    effects.Operation{CapabilityID: "mock", Operation: "send"}}
+		InvocationID: authzInvID(wsTenant, "inv-race"), EffectToken: authzToken,
+		Operation: effects.Operation{CapabilityID: "mock", Operation: "send"}}
 	const workers = 8
 	type outcome struct {
 		rec contract.EffectRecord
@@ -142,11 +142,12 @@ func (c *gateChannel) Send(ctx context.Context, op effects.Operation) (effects.R
 
 func TestLiveRaceContention(t *testing.T) {
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
+	truncateLedger(t, db)
 	gate := &gateChannel{entered: make(chan struct{}), release: make(chan struct{})}
-	svc := effects.New(effects.Config{Pool: db.Pool, Channels: map[string]effects.Channel{"mock": gate}, Canceller: allowCancellation{}, Policy: allowPolicy{}})
+	svc := newAuthService(t, db, map[string]effects.Channel{"mock": gate}, allowCancellation{}, allowPolicy{})
+	seedLiveInvocation(t, db, wsTenant, "inv-live")
 	ctx := context.Background()
-	intent := effects.Intent{BusinessOpID: wsTenant + ":op-live", AttemptID: "a1", InvocationID: "inv-live",
+	intent := effects.Intent{BusinessOpID: wsTenant + ":op-live", AttemptID: "a1", InvocationID: authzInvID(wsTenant, "inv-live"), EffectToken: authzToken,
 		Operation: effects.Operation{CapabilityID: "mock", Operation: "send"}}
 
 	done := make(chan error, 1)
@@ -179,12 +180,13 @@ func TestLiveRaceContention(t *testing.T) {
 
 func TestStalePendingTakeoverSendsOnce(t *testing.T) {
 	svc, db := setupMock(t)
+	seedLiveInvocation(t, db, wsTenant, "inv-op-takeover")
 	ctx := context.Background()
 	_, err := store.WithTenant(ctx, db.Pool, wsTenant, func(tx pgx.Tx) (bool, error) {
 		_, err := tx.Exec(ctx, `INSERT INTO app.effect_records
-			(business_op_id, tenant_id, attempt_id, capability_id, operation, payload, state, updated_at)
-			VALUES ($1, $2, 'a0', 'mock', 'send', '{"mock":{"mode":"accept","opId":"op-takeover"}}', 'PENDING', now() - interval '1 hour')`,
-			wsTenant+":op-takeover", wsTenant)
+			(business_op_id, tenant_id, attempt_id, invocation_id, capability_id, operation, payload, state, updated_at)
+			VALUES ($1, $2, 'a0', $3, 'mock', 'send', '{"mock":{"mode":"accept","opId":"op-takeover"}}', 'PENDING', now() - interval '1 hour')`,
+			wsTenant+":op-takeover", wsTenant, authzInvID(wsTenant, "inv-op-takeover"))
 		return true, err
 	})
 	if err != nil {
@@ -203,7 +205,8 @@ func TestStalePendingTakeoverSendsOnce(t *testing.T) {
 }
 
 func TestOperationReuseConflict(t *testing.T) {
-	svc, _ := setupMock(t)
+	svc, db := setupMock(t)
+	seedLiveInvocation(t, db, wsTenant, "inv-op-reuse")
 	ctx := context.Background()
 	first := mockIntent("op-reuse", mockcap.ModeAccept)
 	if _, err := svc.Perform(ctx, wsTenant, first); err != nil {
@@ -221,10 +224,13 @@ func TestOperationReuseConflict(t *testing.T) {
 }
 
 func TestCrossTenantOpIDs(t *testing.T) {
-	svc, _ := setupMock(t)
+	svc, db := setupMock(t)
+	seedLiveInvocation(t, db, "t-a", "inv-opx")
+	seedLiveInvocation(t, db, "t-b", "inv-opx")
 	ctx := context.Background()
 	mkIntent := func(tenant, local string) effects.Intent {
-		return effects.Intent{BusinessOpID: tenant + ":" + local, AttemptID: "a1", InvocationID: "inv-" + local,
+		return effects.Intent{BusinessOpID: tenant + ":" + local, AttemptID: "a1", InvocationID: authzInvID(tenant, "inv-"+local),
+			EffectToken: authzToken,
 			Operation: effects.Operation{CapabilityID: "mock", Operation: "send",
 				Payload: mockPayload(mockcap.ModeAccept, tenant+"-"+local)}}
 	}
@@ -243,6 +249,7 @@ func TestCrossTenantOpIDs(t *testing.T) {
 
 func TestSettleAndListUnknown(t *testing.T) {
 	svc, db := setupMock(t)
+	seedLiveInvocation(t, db, wsTenant, "inv-op-settle")
 	ctx := context.Background()
 	rec, err := svc.Perform(ctx, wsTenant, mockIntent("op-settle", mockcap.ModeTimeout))
 	if err != nil {
@@ -258,7 +265,7 @@ func TestSettleAndListUnknown(t *testing.T) {
 	if len(found) != 1 || found[0].BusinessOpID != wsTenant+":op-settle" {
 		t.Fatalf("quarantine = %+v, want the settled op", found)
 	}
-	settled, err := svc.Settle(ctx, wsTenant, wsTenant+":op-settle", contract.EffectFailed, "operator: provider confirmed rejection")
+	settled, err := svc.Settle(ctx, wsTenant, wsTenant+":op-settle", contract.EffectFailed, "provider confirmed rejection", "test-operator")
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}
@@ -272,10 +279,10 @@ func TestSettleAndListUnknown(t *testing.T) {
 	if len(found) != 0 {
 		t.Fatalf("quarantine still lists settled op: %+v", found)
 	}
-	if _, err := svc.Settle(ctx, wsTenant, wsTenant+":op-settle", contract.EffectFailed, "again"); err == nil {
+	if _, err := svc.Settle(ctx, wsTenant, wsTenant+":op-settle", contract.EffectFailed, "again", "test-operator"); err == nil {
 		t.Fatal("double settle accepted")
 	}
-	if _, err := svc.Settle(ctx, wsTenant, wsTenant+":op-settle", contract.EffectAttempting, "bad"); err == nil {
+	if _, err := svc.Settle(ctx, wsTenant, wsTenant+":op-settle", contract.EffectAttempting, "bad", "test-operator"); err == nil {
 		t.Fatal("settle to non-terminal accepted")
 	}
 	_ = db
@@ -300,10 +307,11 @@ func TestEffectsCrashWorker(t *testing.T) {
 	}
 	db := testkit.NewDB(t)
 	mockcap.EnsureLog(t, db.Pool)
-	svc := effects.New(effects.Config{Pool: db.Pool, Channels: map[string]effects.Channel{"mock": mockcap.New(db.Pool)}, Canceller: allowCancellation{}, Policy: allowPolicy{}})
+	svc := newAuthService(t, db, map[string]effects.Channel{"mock": mockcap.New(db.Pool)}, allowCancellation{}, allowPolicy{})
 	op := os.Getenv("MINIAPP_EFFECTS_OP")
 	_, _ = svc.Perform(context.Background(), wsTenant, effects.Intent{
-		BusinessOpID: wsTenant + ":" + op, AttemptID: "a-worker", InvocationID: "inv-kill",
+		BusinessOpID: wsTenant + ":" + op, AttemptID: "a-worker", InvocationID: authzInvID(wsTenant, "inv-kill"),
+		EffectToken: authzToken,
 		Operation: effects.Operation{CapabilityID: "mock", Operation: "send",
 			Payload: mockPayload(mockcap.ModeDelayedAck, op)},
 	})
@@ -316,10 +324,11 @@ func TestEffectsCrashWorker(t *testing.T) {
 // holding exactly one send and no blind retry after.
 func TestKillMidSendAdoptsUnknown(t *testing.T) {
 	db := testkit.NewDB(t)
-	db.Truncate(t, "app.effect_records")
+	truncateLedger(t, db)
 	mockcap.EnsureLog(t, db.Pool)
 	mockcap.TruncateLog(t, db.Pool)
 	op := "op-kill"
+	seedLiveInvocation(t, db, wsTenant, "inv-kill")
 	w := testkit.SpawnWorker(t, "TestEffectsCrashWorker", map[string]string{
 		workerEnvKey: "1", "MINIAPP_EFFECTS_OP": op,
 	})
@@ -343,10 +352,11 @@ func TestKillMidSendAdoptsUnknown(t *testing.T) {
 	testkit.Kill9(t, w)
 
 	var sends int
-	svc := effects.New(effects.Config{Pool: db.Pool, Channels: map[string]effects.Channel{
-		"mock": &countChannel{inner: mockcap.New(db.Pool), count: &sends}}, Canceller: allowCancellation{}, Policy: allowPolicy{}})
+	svc := newAuthService(t, db, map[string]effects.Channel{
+		"mock": &countChannel{inner: mockcap.New(db.Pool), count: &sends}}, allowCancellation{}, allowPolicy{})
 	ctx := context.Background()
-	intent := effects.Intent{BusinessOpID: wsTenant + ":" + op, AttemptID: "a-retry", InvocationID: "inv-kill",
+	intent := effects.Intent{BusinessOpID: wsTenant + ":" + op, AttemptID: "a-retry", InvocationID: authzInvID(wsTenant, "inv-kill"),
+		EffectToken: authzToken,
 		Operation: effects.Operation{CapabilityID: "mock", Operation: "send",
 			Payload: mockPayload(mockcap.ModeDelayedAck, op)}}
 	if _, err := svc.Perform(ctx, wsTenant, intent); !errors.Is(err, effects.ErrAttemptInProgress) {

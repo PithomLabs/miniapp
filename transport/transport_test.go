@@ -38,25 +38,25 @@ const (
 	tTenant = "tenant-tr"
 )
 
-func txPolicy() auth.Policy {
+func txPolicy() *auth.Policy {
 	binding := func(agent string, roles ...string) auth.Binding {
 		return auth.Binding{AgentID: agent, Authority: contract.Authority{
 			Kind: contract.AuthorityUser, ID: agent, TenantID: tTenant,
 		}, Roles: roles}
 	}
-	return auth.Policy{
-		Keys: map[string]auth.Binding{
+	return auth.NewPolicy(
+		map[string]auth.Binding{
 			tCred:   binding("agent-tx"),
 			tDecide: binding("human-tx", "tenant-ops"),
 		},
-		Grants: map[string]map[string]contract.TrustMode{
+		map[string]map[string]contract.TrustMode{
 			tTenant: {
 				crmread.ID:    contract.TrustAutonomous,
 				"gated-write": contract.TrustConfirm,
 				classd.ID:     contract.TrustAutonomous,
 			},
 		},
-	}
+	)
 }
 
 func seedContact(t *testing.T, fx *stack.Assembled) {

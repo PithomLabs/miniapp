@@ -1,0 +1,19 @@
+--- /tmp/p25_red11/effects/authorize.go	2026-11-23 22:28:04.446875975 +0800
++++ effects/authorize.go	2026-11-23 22:27:52.553630949 +0800
+@@ -191,6 +191,16 @@
+ 	// Lock 1: invocation identity + liveness + token + tool/trust.
+ 	inv, err := loadInvocationTx(ctx, tx, tenantID, intent.InvocationID)
+ 	if err != nil {
++		if isNoRows(err) {
++			// Deterministic permanent condition (forged ID
++			// or phantom-bound op): terminal binding
++			// refusal, routed through the refusal-audit
++			// path (which skips as unattributable — nothing
++			// was loaded). Genuine connection errors stay
++			// retryable below.
++			return authzDecision{}, &RefusalError{Reason: RefusalBindingMismatch,
++				Msg: "invocation has no row; the binding is invalid"}
++		}
+ 		return authzDecision{}, err
+ 	}
+ 	*attr = inv

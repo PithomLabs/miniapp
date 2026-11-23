@@ -8,11 +8,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/PithomLabs/miniapp/approvals"
+	"github.com/PithomLabs/miniapp/audit"
+	"github.com/PithomLabs/miniapp/auth"
 	"github.com/PithomLabs/miniapp/contract"
 	"github.com/PithomLabs/miniapp/internal/store"
+	"github.com/PithomLabs/miniapp/registry"
 	"github.com/PithomLabs/miniapp/testkit/fault"
 )
 
@@ -76,7 +81,11 @@ type Channel interface {
 // ledger row. InvocationID links the effect to its canonical
 // invocation for cancellation gating and attribution.
 type Intent struct {
-	BusinessOpID   string
+	BusinessOpID string
+	// AttemptID is retained for wire compatibility only.
+	// Deprecated: the framework mints the authoritative
+	// attempt ID at claim time; this field is never
+	// persisted and never authorizes.
 	AttemptID      string
 	IdempotencyKey string
 	InvocationID   string
@@ -85,6 +94,12 @@ type Intent struct {
 	// it against the invocation row.
 	EffectToken string
 	Operation   Operation
+	// Sequence carries entity-sequence identity when the operation
+	// is sequence-bound, set by framework workflow code from its
+	// durable claim step. Nil for ordinary operations. Identity
+	// without an installed verifier fails closed; it never
+	// authorizes by itself.
+	Sequence *SequenceRef
 }
 
 // ErrInvocationCancelled reports an effect claim for an invocation
@@ -110,6 +125,11 @@ type Service struct {
 	channels  map[string]Channel
 	canceller Cancellation
 	policy    PolicyChecker
+	registry  *registry.Registry
+	grants    *auth.Policy
+	approver  *approvals.Service
+	auditor   *audit.Service
+	sequences SequenceVerifier
 	// AttemptLease overrides DefaultAttemptLease when positive.
 	AttemptLease time.Duration
 	// TestFault injects failures at named effect boundaries for
@@ -119,20 +139,31 @@ type Service struct {
 	TestFault *fault.Injector
 }
 
-// Config wires an effects service. Every dependency is required:
-// canceller gates claims on liveness and policy revalidates
-// authority; either missing fails closed at Perform time.
+// Config wires an effects service. Pool, Channels, Canceller,
+// Policy, Registry, Grants, and Approver are required (nil fails
+// closed wherever used). Auditor is nil-tolerant (refusal audits
+// skip silently; production and refusal-asserting tests wire
+// one). Sequences is nil when the deployment serves no sequence
+// domain; a sequence-bound operation without an installed
+// verifier fails closed.
 type Config struct {
 	Pool      *pgxpool.Pool
 	Channels  map[string]Channel
 	Canceller Cancellation
 	Policy    PolicyChecker
+	Registry  *registry.Registry
+	Grants    *auth.Policy
+	Approver  *approvals.Service
+	Auditor   *audit.Service
+	Sequences SequenceVerifier
 }
 
 // New returns a service dispatching by capability ID.
 func New(cfg Config) *Service {
 	return &Service{pool: cfg.Pool, channels: cfg.Channels, canceller: cfg.Canceller,
-		policy: cfg.Policy, AttemptLease: DefaultAttemptLease}
+		policy: cfg.Policy, registry: cfg.Registry, grants: cfg.Grants,
+		approver: cfg.Approver, auditor: cfg.Auditor, sequences: cfg.Sequences,
+		AttemptLease: DefaultAttemptLease}
 }
 
 func (s *Service) lease() time.Duration {
@@ -168,6 +199,9 @@ func (s *Service) Perform(ctx context.Context, tenantID string, intent Intent) (
 	if rec, err := s.load(ctx, tenantID, intent.BusinessOpID); err == nil {
 		if err := s.checkOperation(ctx, tenantID, intent.Operation, rec); err != nil {
 			return contract.EffectRecord{}, err
+		}
+		if rec.State == contract.EffectNotApplied {
+			return s.reconcile(ctx, tenantID, intent, rec)
 		}
 		if settled(rec.State) {
 			return rec, nil
@@ -262,7 +296,9 @@ func (s *Service) attempt(ctx context.Context, tenantID string, intent Intent, r
 	if err := s.TestFault.Fire("attempt-begin"); err != nil {
 		return contract.EffectRecord{}, err
 	}
-	rec, err := s.transition(ctx, tenantID, rec, contract.EffectAttempting, "", "")
+	// Authorize against the persisted epoch from the claim load,
+	// never the caller's Intent.AttemptID (untrusted input).
+	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeFresh, rec.AttemptID)
 	if err != nil {
 		return contract.EffectRecord{}, err
 	}
@@ -298,17 +334,29 @@ func (s *Service) sendAndRecord(ctx context.Context, tenantID string, ch Channel
 
 // claim inserts the PENDING record, or loads the existing one when
 // this business operation was already attempted. The boolean reports
-// whether this call owns the first attempt.
+// whether this call owns the first attempt. The attempt ID is
+// always framework-minted here: caller-supplied
+// Intent.AttemptID is never persisted (empty, malformed,
+// colliding, or attacker-chosen values are all ignored). A
+// mint failure fails closed before any write.
 func (s *Service) claim(ctx context.Context, tenantID string, intent Intent) (contract.EffectRecord, bool, error) {
 	if err := s.TestFault.Fire("effect-reserve"); err != nil {
 		return contract.EffectRecord{}, false, err
+	}
+	minted, err := uuid.NewRandom()
+	if err != nil {
+		return contract.EffectRecord{}, false, fmt.Errorf("effects: attempt ID mint failed: %w", err)
+	}
+	attemptID := minted.String()
+	if attemptID == "" {
+		return contract.EffectRecord{}, false, fmt.Errorf("effects: minted attempt ID is empty")
 	}
 	inserted, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
 		tag, err := tx.Exec(ctx, `INSERT INTO app.effect_records
 			(business_op_id, tenant_id, attempt_id, idempotency_key, invocation_id, capability_id, operation, payload, state)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING')
 			ON CONFLICT (business_op_id) DO NOTHING`,
-			intent.BusinessOpID, tenantID, intent.AttemptID, intent.IdempotencyKey, intent.InvocationID,
+			intent.BusinessOpID, tenantID, attemptID, intent.IdempotencyKey, intent.InvocationID,
 			intent.Operation.CapabilityID, intent.Operation.Operation, string(intent.Operation.Payload))
 		if err != nil {
 			return false, err
@@ -346,6 +394,9 @@ func (s *Service) load(ctx context.Context, tenantID, opID string) (contract.Eff
 // stale PENDING row was never attempted, so the adopter takes it
 // over and executes the attempt itself.
 func (s *Service) adopt(ctx context.Context, tenantID string, intent Intent, rec contract.EffectRecord) (contract.EffectRecord, error) {
+	if rec.State == contract.EffectNotApplied {
+		return s.reconcile(ctx, tenantID, intent, rec)
+	}
 	if settled(rec.State) {
 		return rec, nil
 	}
@@ -364,50 +415,47 @@ func (s *Service) adopt(ctx context.Context, tenantID string, intent Intent, rec
 }
 
 // takeover claims a stale PENDING row for this worker and executes
-// the attempt. The age predicate keeps the take-over race-safe: if
-// the row moved (or freshened) under us, contention — not a blind
-// send — is the answer.
+// the attempt through full authorization with a fresh attempt ID.
+// The age predicate inside the authorization transaction keeps the
+// take-over race-safe: if the row moved (or freshened) under us,
+// contention — not a blind send — is the answer.
 func (s *Service) takeover(ctx context.Context, tenantID string, intent Intent, rec contract.EffectRecord) (contract.EffectRecord, error) {
-	r := rec
-	if err := r.Transition(contract.EffectAttempting); err != nil {
-		return contract.EffectRecord{}, err
-	}
 	if err := s.TestFault.Fire("takeover-begin"); err != nil {
 		return contract.EffectRecord{}, err
 	}
-	r.UpdatedAt = time.Now().UTC()
-	cutoff := time.Now().UTC().Add(-s.lease())
-	affected, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (int64, error) {
-		tag, err := tx.Exec(ctx, `UPDATE app.effect_records SET state = 'ATTEMPTING', updated_at = now()
-			WHERE business_op_id = $1 AND tenant_id = $2 AND state = 'PENDING' AND updated_at <= $3`,
-			r.BusinessOpID, tenantID, cutoff)
-		if err != nil {
-			return 0, err
-		}
-		return tag.RowsAffected(), nil
-	})
+	ch, ok := s.channels[intent.Operation.CapabilityID]
+	if !ok {
+		return s.transition(ctx, tenantID, rec, contract.EffectFailed, "", "unknown capability")
+	}
+	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeTakeover, uuid.NewString())
 	if err != nil {
 		return contract.EffectRecord{}, err
 	}
-	if affected == 0 {
-		fresh, lerr := s.load(ctx, tenantID, rec.BusinessOpID)
-		if lerr != nil {
-			return contract.EffectRecord{}, lerr
-		}
-		return fresh, ErrAttemptInProgress
-	}
+	return s.sendAndRecord(ctx, tenantID, ch, intent, rec)
+}
+
+// reconcile retries a NOT_APPLIED row through a fresh
+// authorization with a new attempt ID. Reconciliation never
+// inherits the dead attempt's ownership.
+func (s *Service) reconcile(ctx context.Context, tenantID string, intent Intent, rec contract.EffectRecord) (contract.EffectRecord, error) {
 	ch, ok := s.channels[intent.Operation.CapabilityID]
 	if !ok {
-		return s.transition(ctx, tenantID, r, contract.EffectFailed, "", "unknown capability")
+		return s.transition(ctx, tenantID, rec, contract.EffectFailed, "", "unknown capability")
 	}
-	return s.sendAndRecord(ctx, tenantID, ch, intent, r)
+	rec, err := s.authorizeAttempt(ctx, tenantID, intent, AuthorizeReconcile, uuid.NewString())
+	if err != nil {
+		return contract.EffectRecord{}, err
+	}
+	return s.sendAndRecord(ctx, tenantID, ch, intent, rec)
 }
 
 // transition moves one record through the contract state machine,
-// guarded by an expected-state predicate: the write lands only when
-// the row still shows the state we based our decision on. A lost
-// race returns the current record with ErrAttemptSuperseded instead
-// of overwriting the winner.
+// guarded by an expected-state AND attempt-identity predicate: the
+// write lands only when the row still shows the state and the
+// attempt epoch we based our decision on, so a stale worker can
+// never overwrite a newer attempt's result. A lost race returns
+// the current record with ErrAttemptSuperseded instead of
+// overwriting the winner.
 func (s *Service) transition(ctx context.Context, tenantID string, rec contract.EffectRecord, next contract.EffectState, req, reply string) (contract.EffectRecord, error) {
 	r := rec
 	if err := r.Transition(next); err != nil {
@@ -418,8 +466,8 @@ func (s *Service) transition(ctx context.Context, tenantID string, rec contract.
 	affected, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (int64, error) {
 		tag, err := tx.Exec(ctx, `UPDATE app.effect_records SET state = $1, provider_request = $2,
 			provider_reply = $3, updated_at = now()
-			WHERE business_op_id = $4 AND tenant_id = $5 AND state = $6`,
-			string(r.State), req, reply, r.BusinessOpID, tenantID, string(rec.State))
+			WHERE business_op_id = $4 AND tenant_id = $5 AND state = $6 AND attempt_id = $7`,
+			string(r.State), req, reply, r.BusinessOpID, tenantID, string(rec.State), rec.AttemptID)
 		if err != nil {
 			return 0, err
 		}
@@ -541,30 +589,139 @@ func (s *Service) SetKillSwitch(ctx context.Context, name string, engaged bool) 
 	return err
 }
 
-// Settle records an operator decision on a quarantined record,
-// following the frozen machine (UNKNOWN → RECONCILING → terminal).
-// Only CONFIRMED, FAILED, or NOT_APPLIED settle; anything else (and
-// any non-UNKNOWN row) is rejected. The note should cite the
-// evidence behind the decision.
-func (s *Service) Settle(ctx context.Context, tenantID, opID string, outcome contract.EffectState, note string) (contract.EffectRecord, error) {
+// ErrAlreadySettled reports a conflicting second settlement: the
+// operation already settled to a different outcome or note. The
+// first decision stands; this is terminal, not retryable.
+var ErrAlreadySettled = errors.New("effects: effect already settled to a different outcome")
+
+// ErrPhantomBinding reports settlement (or attribution) for an
+// operation bound to a missing invocation row: a deterministic
+// permanent condition, terminal rather than retryable.
+var ErrPhantomBinding = errors.New("effects: operation is bound to a missing invocation")
+
+// Settle records an operator decision on a quarantined record in
+// ONE transaction: predicated UNKNOWN → outcome plus the
+// effect-settled audit row commit together, or neither does. Only
+// CONFIRMED, FAILED, or NOT_APPLIED settle. The note should cite
+// the evidence; the operator string attributes the human.
+// Repeating an identical settlement succeeds idempotently (and
+// backfills a missing audit row); a conflicting one fails with
+// ErrAlreadySettled.
+func (s *Service) Settle(ctx context.Context, tenantID, opID string, outcome contract.EffectState, note, operator string) (contract.EffectRecord, error) {
 	switch outcome {
 	case contract.EffectConfirmed, contract.EffectFailed, contract.EffectNotApplied:
 	default:
 		return contract.EffectRecord{}, fmt.Errorf("effects: cannot settle to %s", outcome)
 	}
-	rec, err := s.load(ctx, tenantID, opID)
+	if operator == "" {
+		return contract.EffectRecord{}, fmt.Errorf("effects: settling operator is required")
+	}
+	if s.auditor == nil {
+		return contract.EffectRecord{}, fmt.Errorf("effects: settle auditor is not wired")
+	}
+	var settled contract.EffectRecord
+	_, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+		cur, err := s.loadTx(ctx, tx, tenantID, opID)
+		if err != nil {
+			return false, err
+		}
+		if cur.State != contract.EffectUnknown {
+			if cur.State == outcome && cur.ProviderReply == note {
+				// Idempotent repeat: backfill a missing audit,
+				// then succeed without touching the row.
+				if err := s.backfillSettleAudit(ctx, tx, tenantID, cur, outcome, note, operator); err != nil {
+					return false, err
+				}
+				settled = cur
+				return true, nil
+			}
+			if cur.State == contract.EffectPending || cur.State == contract.EffectAttempting {
+				return false, fmt.Errorf("effects: only UNKNOWN records settle (have %s)", cur.State)
+			}
+			return false, fmt.Errorf("%w: have %s", ErrAlreadySettled, cur.State)
+		}
+		if err := s.TestFault.Fire("settle-operator-commit"); err != nil {
+			return false, err
+		}
+		tag, err := tx.Exec(ctx, `UPDATE app.effect_records
+			SET state = $1, provider_reply = $2, updated_at = now()
+			WHERE business_op_id = $3 AND tenant_id = $4 AND state = 'UNKNOWN'`,
+			string(outcome), note, opID, tenantID)
+		if err != nil {
+			return false, err
+		}
+		if tag.RowsAffected() != 1 {
+			return false, ErrAttemptSuperseded
+		}
+		if err := s.insertSettleAudit(ctx, tx, tenantID, cur, outcome, note, operator); err != nil {
+			return false, err
+		}
+		settled, err = s.loadTx(ctx, tx, tenantID, opID)
+		return err == nil, err
+	})
 	if err != nil {
 		return contract.EffectRecord{}, err
 	}
-	if rec.State != contract.EffectUnknown {
-		return contract.EffectRecord{}, fmt.Errorf("effects: only UNKNOWN records settle (have %s)", rec.State)
+	if ferr := s.TestFault.Fire("settle-operator-response"); ferr != nil {
+		return contract.EffectRecord{}, ferr
 	}
-	if err := s.TestFault.Fire("settle-operator-commit"); err != nil {
-		return contract.EffectRecord{}, err
-	}
-	rec, err = s.transition(ctx, tenantID, rec, contract.EffectReconciling, rec.ProviderRequest, note)
+	return settled, nil
+}
+
+// loadIdentityTx reads an invocation's immutable identity columns
+// without taking any lock. Attribution needs miniapp, version, and
+// tool only, and no UPDATE path mutates them (all six mutation
+// sites write status, run, result, error, or timestamps), so the
+// unlocked read cannot tear. Settle uses this after holding the
+// effect row, keeping the §4.2 footprint "5 effect" only — never
+// recreating the effect → invocation edge.
+func loadIdentityTx(ctx context.Context, tx pgx.Tx, tenantID, invocationID string) (miniapp, version, tool string, err error) {
+	err = tx.QueryRow(ctx, `SELECT miniapp_id, miniapp_version, tool
+		FROM app.invocations WHERE id = $1::uuid AND tenant_id = $2`,
+		invocationID, tenantID).Scan(&miniapp, &version, &tool)
+	return miniapp, version, tool, err
+}
+
+// insertSettleAudit records the settlement inside the settling
+// transaction: the terminal outcome and its audit commit
+// together, so a committed settlement is never unaudited.
+func (s *Service) insertSettleAudit(ctx context.Context, tx pgx.Tx, tenantID string, rec contract.EffectRecord, outcome contract.EffectState, note, operator string) error {
+	miniapp, version, tool, err := loadIdentityTx(ctx, tx, tenantID, rec.InvocationID)
 	if err != nil {
-		return contract.EffectRecord{}, err
+		if isNoRows(err) {
+			return ErrPhantomBinding
+		}
+		return fmt.Errorf("effects: cannot attribute settlement: %w", err)
 	}
-	return s.transition(ctx, tenantID, rec, outcome, rec.ProviderRequest, note)
+	details, _ := json.Marshal(map[string]any{
+		"business_op_id": rec.BusinessOpID,
+		"note":           note,
+	})
+	return s.auditor.InsertTx(ctx, tx, audit.Event{
+		TenantID: tenantID, AgentID: operator,
+		AuthorityKind: string(contract.AuthorityUser), AuthorityID: operator,
+		MiniappID: miniapp, Version: version, Tool: tool,
+		InvocationID: rec.InvocationID,
+		Action:       "effect-settled", Outcome: strings.ToLower(string(outcome)),
+		Details: details,
+	})
+}
+
+// backfillSettleAudit inserts the settlement audit for an already
+// settled row when (and only when) no matching audit exists —
+// covering rows settled before audits were atomic, without ever
+// double-recording.
+func (s *Service) backfillSettleAudit(ctx context.Context, tx pgx.Tx, tenantID string, rec contract.EffectRecord, outcome contract.EffectState, note, operator string) error {
+	var n int
+	err := tx.QueryRow(ctx, `SELECT count(*) FROM app.audit_events
+		WHERE tenant_id = $1 AND action = 'effect-settled'
+		AND details->>'business_op_id' = $2`,
+		tenantID, rec.BusinessOpID).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	return s.insertSettleAudit(ctx, tx, tenantID, rec, outcome, note, operator)
 }

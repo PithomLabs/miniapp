@@ -6,7 +6,16 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/PithomLabs/miniapp/approvals"
+	"github.com/PithomLabs/miniapp/audit"
+	"github.com/PithomLabs/miniapp/auth"
+	"github.com/PithomLabs/miniapp/contract"
 	"github.com/PithomLabs/miniapp/effects"
+	"github.com/PithomLabs/miniapp/internal/store"
+	"github.com/PithomLabs/miniapp/registry"
 	"github.com/PithomLabs/miniapp/testkit"
 	"github.com/PithomLabs/miniapp/testkit/mockcap"
 )
@@ -120,15 +129,39 @@ func TestMockTenantAttribution(t *testing.T) {
 	db := testkit.NewDB(t)
 	mockcap.EnsureLog(t, db.Pool)
 	mockcap.TruncateLog(t, db.Pool)
-	db.Truncate(t, "app.effect_records")
+	db.Truncate(t, "app.effect_records", "app.invocations")
+	reg := registry.New()
+	testkit.RegisterClassATool(t, reg, "t-mock-fix", "t.mock", "", nil,
+		func(ctx context.Context, call registry.ToolCall) (json.RawMessage, error) {
+			return json.RawMessage(`{}`), nil
+		})
 	ctx := context.Background()
 	svc := effects.New(effects.Config{Pool: db.Pool,
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
-		Canceller: allowCanceller{}, Policy: allowPolicy{}})
+		Canceller: allowCanceller{}, Policy: allowPolicy{},
+		Registry: reg,
+		Grants: auth.NewPolicy(nil, map[string]map[string]contract.TrustMode{
+			"tenant-a": {"t-mock-fix": contract.TrustAutonomous},
+			"tenant-b": {"t-mock-fix": contract.TrustAutonomous},
+		}),
+		Approver: approvals.New(db.Pool), Auditor: audit.New(db.Pool, nil),
+	})
 	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		invID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(tenant+"\x00shared")).String()
+		_, err := store.WithTenant(ctx, db.Pool, tenant, func(tx pgx.Tx) (bool, error) {
+			_, err := tx.Exec(ctx, `INSERT INTO app.invocations
+				(id, tenant_id, miniapp_id, miniapp_version, tool, idempotency_key, input,
+				 status, trust_mode, effect_token)
+				VALUES ($1, $2, 't-mock-fix', '1.0.0', 't.mock', $3, '{}', 'running', 'autonomous', 'tok-mock-fix')`,
+				invID, tenant, "key-"+tenant)
+			return true, err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		if _, err := svc.Perform(ctx, tenant, effects.Intent{
 			BusinessOpID: tenant + ":shared-op", AttemptID: "a1",
-			InvocationID: "inv-" + tenant,
+			InvocationID: invID, EffectToken: "tok-mock-fix",
 			Operation: effects.Operation{CapabilityID: "mock", Operation: "send",
 				Payload: payload(mockcap.ModeAccept, "shared-provider-op")},
 		}); err != nil {

@@ -1,0 +1,358 @@
+--- /tmp/p25_red/effects/authorize.go	2026-11-23 21:43:48.000000000 +0800
++++ effects/authorize.go	2026-11-23 22:27:52.553630949 +0800
+@@ -26,8 +26,7 @@
+ )
+ 
+ // RefusalReason names why authorization refused. Terminality is
+-// carried separately (RefusalError.Withdrawn + error identity),
+-// never inferred from the name.
++// carried by error identity, never inferred from the name.
+ type RefusalReason string
+ 
+ const (
+@@ -37,6 +36,7 @@
+ 	RefusalApprovalCancelled RefusalReason = "approval-cancelled"
+ 	RefusalApprovalMismatch  RefusalReason = "approval-mismatch"
+ 	RefusalGrantDenied       RefusalReason = "grant-denied"
++	RefusalTrustModeMismatch RefusalReason = "trust-mode-mismatch"
+ 	RefusalKillSwitch        RefusalReason = "kill-switch-engaged"
+ 	RefusalTokenMismatch     RefusalReason = "token-mismatch"
+ 	RefusalStaleOwnership    RefusalReason = "stale-ownership"
+@@ -44,13 +44,12 @@
+ )
+ 
+ // RefusalError is a terminal fail-closed authorization refusal.
+-// Withdrawn reports whether the effect row was flipped
+-// PENDING → CANCELLED in the same transaction (terminal
+-// invocations only — see the withdraw rule).
++// Terminal-invocation withdrawals commit inside the authorization
++// transaction with their paired audit (see terminalWithdrawTx);
++// they are reported through the decision, never through this type.
+ type RefusalError struct {
+-	Reason    RefusalReason
+-	Msg       string
+-	Withdrawn bool
++	Reason RefusalReason
++	Msg    string
+ }
+ 
+ // Error renders the refusal with its reason code.
+@@ -109,14 +108,27 @@
+ 	AuthorizeReconcile
+ )
+ 
++// authzDecision is the committed outcome of the authorization
++// transaction. Exactly one of rec (authorized) or refusal (a
++// terminal-invocation decision committed with its paired audit) is
++// set. logged carries the in-transaction audit event needing its
++// post-commit log line, or nil when nothing was recorded in-tx.
++type authzDecision struct {
++	rec     contract.EffectRecord
++	refusal error
++	logged  *audit.Event
++}
++
+ // authorizeAttempt evaluates the complete authorization read set
+ // and conditionally transitions the effect to ATTEMPTING in one
+ // database transaction. On success the returned record is
+ // ATTEMPTING and the caller must send through the canonical
+ // path. Refusals and wait signals never transition; infra
+-// failures are retryable; nothing is committed on any error
+-// path except a terminal-invocation withdraw (flagged on the
+-// returned RefusalError).
++// failures are retryable. A terminal-invocation decision commits
++// first (withdrawal, if won, with its paired audit in the same
++// transaction) and is then returned as a typed refusal; a commit
++// failure surfaces as infrastructure failure and never reports a
++// withdrawal.
+ //
+ // attemptID is the caller's ownership epoch: fresh attempts
+ // present the claimed ID, takeovers and reconciles present a
+@@ -133,20 +145,26 @@
+ 	}
+ 	s.grants.RLock()
+ 	defer s.grants.RUnlock()
+-	var withdrawn bool
+ 	attr := &invocationAuth{}
+-	rec, rerr := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (contract.EffectRecord, error) {
+-		return s.authorizeTx(ctx, tx, tenantID, intent, mode, attemptID, &withdrawn, attr)
++	out, rerr := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (authzDecision, error) {
++		return s.authorizeTx(ctx, tx, tenantID, intent, mode, attemptID, attr)
+ 	})
+ 	if rerr != nil {
+-		// Audit genuine refusals only: contention, waits,
+-		// supersession, and infra failures are not refusals.
++		// Nothing committed: audit genuine refusals only.
++		// Contention, waits, supersession, and infra failures
++		// are not refusals.
+ 		if reason, ok := refusalReason(rerr); ok {
+-			s.auditRefusal(ctx, tenantID, intent, *attr, reason, withdrawn)
++			s.auditRefusal(ctx, tenantID, intent, *attr, reason)
+ 		}
+ 		return contract.EffectRecord{}, rerr
+ 	}
+-	return rec, nil
++	if out.logged != nil && s.auditor != nil {
++		s.auditor.Log(*out.logged)
++	}
++	if out.refusal != nil {
++		return contract.EffectRecord{}, out.refusal
++	}
++	return out.rec, nil
+ }
+ 
+ // refusalReason classifies an authorization outcome for audit:
+@@ -164,79 +182,150 @@
+ }
+ 
+ // authorizeTx runs the ordered read set and predicated transition
+-// inside one transaction. It returns (record, nil) on authorization
+-// and (zero, outcome) otherwise; outcome is a *RefusalError,
++// inside one transaction. It returns (decision, nil) when the
++// transaction may commit — either an authorization or a
++// terminal-invocation decision with its paired audit — and
++// (zero, outcome) otherwise; outcome is a *RefusalError,
+ // ErrApprovalPending, a contention error, or an infra error.
+-func (s *Service) authorizeTx(ctx context.Context, tx pgx.Tx, tenantID string, intent Intent, mode AttemptMode, attemptID string, withdrawn *bool, attr *invocationAuth) (contract.EffectRecord, error) {
++func (s *Service) authorizeTx(ctx context.Context, tx pgx.Tx, tenantID string, intent Intent, mode AttemptMode, attemptID string, attr *invocationAuth) (authzDecision, error) {
+ 	// Lock 1: invocation identity + liveness + token + tool/trust.
+ 	inv, err := loadInvocationTx(ctx, tx, tenantID, intent.InvocationID)
+ 	if err != nil {
+-		return contract.EffectRecord{}, err
++		if isNoRows(err) {
++			// Deterministic permanent condition (forged ID
++			// or phantom-bound op): terminal binding
++			// refusal, routed through the refusal-audit
++			// path (which skips as unattributable — nothing
++			// was loaded). Genuine connection errors stay
++			// retryable below.
++			return authzDecision{}, &RefusalError{Reason: RefusalBindingMismatch,
++				Msg: "invocation has no row; the binding is invalid"}
++		}
++		return authzDecision{}, err
+ 	}
+ 	*attr = inv
+ 	if intent.EffectToken == "" || inv.token == "" || intent.EffectToken != inv.token {
+-		return contract.EffectRecord{}, &RefusalError{Reason: RefusalTokenMismatch, Msg: "effect token does not match invocation"}
++		return authzDecision{}, &RefusalError{Reason: RefusalTokenMismatch, Msg: "effect token does not match invocation"}
+ 	}
+ 	live, terminal := invocationEligible(inv.status)
+ 	if !live {
+ 		if terminal {
+ 			// Irreversible terminal (cancelled/failed/succeeded):
+-			// withdraw a pending row in this same tx, then refuse.
+-			// Pending and quarantined refuse without withdrawing:
+-			// pending is unsubmitted (nothing to withdraw from the
+-			// submitter's view — the row may still park), and
+-			// quarantined is resumable.
+-			*withdrawn = s.withdrawIfPending(ctx, tx, tenantID, intent.BusinessOpID)
+-		}
+-		return contract.EffectRecord{}, terminalInvocationRefusal(inv.status)
++			// withdraw a pending row and pair its audit in
++			// this same tx, then refuse after commit.
++			return s.terminalWithdrawTx(ctx, tx, tenantID, intent, inv)
++		}
++		// Pending and quarantined refuse without withdrawing:
++		// pending is unsubmitted (nothing to withdraw from the
++		// submitter's view — the row may still park), and
++		// quarantined is resumable.
++		return authzDecision{}, terminalInvocationRefusal(inv.status)
+ 	}
+ 	// Tool resolution (in-memory registry): determines whether an
+ 	// approval linkage is required and which kill switch applies.
+ 	manifest, _, err := s.registry.Resolve(inv.miniapp, inv.version)
+ 	if err != nil {
+-		return contract.EffectRecord{}, &RefusalError{Reason: RefusalBindingMismatch, Msg: fmt.Sprintf("unknown miniapp %s", inv.miniapp)}
++		return authzDecision{}, &RefusalError{Reason: RefusalBindingMismatch, Msg: fmt.Sprintf("unknown miniapp %s", inv.miniapp)}
+ 	}
+ 	tool, err := findTool(manifest, inv.tool)
+ 	if err != nil {
+-		return contract.EffectRecord{}, &RefusalError{Reason: RefusalBindingMismatch, Msg: fmt.Sprintf("unknown tool %s", inv.tool)}
++		return authzDecision{}, &RefusalError{Reason: RefusalBindingMismatch, Msg: fmt.Sprintf("unknown tool %s", inv.tool)}
+ 	}
+-	// Lock 2: approval linkage (gated tools only).
+-	if tool.Approval.Required {
++	// Persisted-trust admission: the manifest's declared TrustModes
++	// admit the invocation's persisted trust, independent of the
++	// approval linkage below. An empty list declares no restriction
++	// (legacy manifests); an explicit list refuses anything
++	// unlisted, so the linkage exception can never launder a
++	// manifest-disallowed trust mode. Caller claims cannot
++	// influence this: Intent carries no trust field.
++	if len(tool.TrustModes) > 0 && !trustAdmitted(tool.TrustModes, inv.trust) {
++		return authzDecision{}, &RefusalError{Reason: RefusalTrustModeMismatch,
++			Msg: fmt.Sprintf("tool %s does not admit %s trust", inv.tool, inv.trust)}
++	}
++	// Lock 2: approval linkage (gated tools only), skipped when the
++	// persisted invocation trust is autonomous and the manifest
++	// explicitly permits autonomous execution — mirroring the
++	// submit-time choke, which admits autonomous gated workflows
++	// without linkage. All other checks still apply.
++	if tool.Approval.Required && !autonomousLinkageExempt(tool, inv.trust) {
+ 		appr, err := s.approver.ByInvocationTx(ctx, tx, tenantID, intent.InvocationID)
+ 		if err != nil {
+ 			if isNoRows(err) {
+-				return contract.EffectRecord{}, &RefusalError{Reason: RefusalApprovalMissing, Msg: "no approval linkage for invocation"}
++				return authzDecision{}, &RefusalError{Reason: RefusalApprovalMissing, Msg: "no approval linkage for invocation"}
+ 			}
+-			return contract.EffectRecord{}, err
++			return authzDecision{}, err
+ 		}
+ 		if out := checkApprovalBinding(inv, appr, tool); out != nil {
+-			return contract.EffectRecord{}, out
++			return authzDecision{}, out
+ 		}
+ 	}
+ 	// Lock 3: sequence fence (sequence-bound operations only).
+ 	if intent.Sequence != nil {
+ 		if s.sequences == nil {
+-			return contract.EffectRecord{}, &RefusalError{Reason: RefusalStaleOwnership, Msg: "sequence identity present but no sequence verifier installed"}
++			return authzDecision{}, &RefusalError{Reason: RefusalStaleOwnership, Msg: "sequence identity present but no sequence verifier installed"}
+ 		}
+ 		if err := s.sequences.VerifyGeneration(ctx, tx, SequenceBinding{
+ 			TenantID: tenantID, InvocationID: intent.InvocationID,
+ 			OpID: intent.BusinessOpID, Ref: *intent.Sequence,
+ 		}); err != nil {
+-			return contract.EffectRecord{}, &RefusalError{Reason: RefusalStaleOwnership, Msg: err.Error()}
++			return authzDecision{}, &RefusalError{Reason: RefusalStaleOwnership, Msg: err.Error()}
+ 		}
+ 	}
+ 	// Lock 4: kill switches FOR SHARE + pinned grant read (RLock
+ 	// held by the caller across the whole tx).
+ 	if hit, err := s.engagedSwitchTx(ctx, tx, tenantID, inv.miniapp, intent.Operation.CapabilityID, tool.Limits.KillSwitch); err != nil {
+-		return contract.EffectRecord{}, err
++		return authzDecision{}, err
+ 	} else if hit != "" {
+-		return contract.EffectRecord{}, &RefusalError{Reason: RefusalKillSwitch, Msg: fmt.Sprintf("kill switch %q is engaged", hit)}
++		return authzDecision{}, &RefusalError{Reason: RefusalKillSwitch, Msg: fmt.Sprintf("kill switch %q is engaged", hit)}
+ 	}
+ 	if !s.grants.GrantAllowsLocked(tenantID, inv.miniapp, inv.trust) {
+-		return contract.EffectRecord{}, &RefusalError{Reason: RefusalGrantDenied, Msg: fmt.Sprintf("no live grant covers %s at this trust", inv.miniapp)}
++		return authzDecision{}, &RefusalError{Reason: RefusalGrantDenied, Msg: fmt.Sprintf("no live grant covers %s at this trust", inv.miniapp)}
+ 	}
+ 	// Lock 5: predicated effect transition (last statement).
+-	return s.transitionAuthorized(ctx, tx, tenantID, intent, mode, attemptID)
++	rec, err := s.transitionAuthorized(ctx, tx, tenantID, intent, mode, attemptID)
++	if err != nil {
++		return authzDecision{}, err
++	}
++	return authzDecision{rec: rec}, nil
++}
++
++// terminalWithdrawTx executes the terminal-invocation decision
++// inside the authorization transaction: the predicated
++// PENDING → CANCELLED flip, the affected-row check, and the paired
++// audit insert commit or roll back together. The withdrawal wins
++// exactly when the row is still PENDING; otherwise the refusal
++// audits as refused, never as a second withdrawal. The returned
++// decision carries the typed refusal for post-commit return; any
++// error rolls back with no audit and surfaces as infra failure.
++func (s *Service) terminalWithdrawTx(ctx context.Context, tx pgx.Tx, tenantID string, intent Intent, inv invocationAuth) (authzDecision, error) {
++	won, err := s.withdrawIfPending(ctx, tx, tenantID, intent.BusinessOpID)
++	if err != nil {
++		return authzDecision{}, err
++	}
++	var logged *audit.Event
++	if s.auditor != nil {
++		action, result := "effect-refused", "refused"
++		if won {
++			action, result = "effect-withdrawn", "withdrawn"
++		}
++		details, _ := json.Marshal(map[string]any{
++			"business_op_id": intent.BusinessOpID,
++			"invocation_id":  intent.InvocationID,
++			"reason":         "invocation-ineligible",
++		})
++		e := audit.Event{
++			TenantID: tenantID, AgentID: "framework",
++			AuthorityKind: string(contract.AuthorityService), AuthorityID: "effects.authorize",
++			MiniappID: inv.miniapp, Version: inv.version, Tool: inv.tool,
++			Action: action, Outcome: result, InvocationID: intent.InvocationID,
++			Details: details,
++		}
++		if err := s.auditor.InsertTx(ctx, tx, e); err != nil {
++			return authzDecision{}, err
++		}
++		logged = &e
++	}
++	return authzDecision{refusal: terminalInvocationRefusal(inv.status), logged: logged}, nil
+ }
+ 
+ // invocationEligible reports (live, terminal) under P21-002
+@@ -261,6 +350,25 @@
+ 	return fmt.Errorf("%w: invocation is %s", ErrInvocationCancelled, status)
+ }
+ 
++// trustAdmitted reports whether a declared trust-mode list admits a
++// persisted trust mode.
++func trustAdmitted(modes []contract.TrustMode, trust contract.TrustMode) bool {
++	for _, m := range modes {
++		if m == trust {
++			return true
++		}
++	}
++	return false
++}
++
++// autonomousLinkageExempt reports whether the persisted
++// autonomous trust skips the human-approval linkage: only when the
++// admitted tool manifest explicitly permits autonomous execution.
++// An empty TrustModes list never grants the exemption.
++func autonomousLinkageExempt(tool contract.ToolManifest, trust contract.TrustMode) bool {
++	return trust == contract.TrustAutonomous && trustAdmitted(tool.TrustModes, contract.TrustAutonomous)
++}
++
+ // checkApprovalBinding verifies the linkage against server-read
+ // invocation state. It returns nil to proceed, ErrApprovalPending
+ // to wait, or a terminal *RefusalError.
+@@ -340,15 +448,17 @@
+ 	return inv, nil
+ }
+ 
+-// this call withdrew.
+-func (s *Service) withdrawIfPending(ctx context.Context, tx pgx.Tx, tenantID, opID string) bool {
++// withdrawIfPending flips a still-PENDING row to CANCELLED. It
++// reports whether this call won the withdrawal; a statement error
++// is infrastructure failure, never a lost withdrawal.
++func (s *Service) withdrawIfPending(ctx context.Context, tx pgx.Tx, tenantID, opID string) (bool, error) {
+ 	tag, err := tx.Exec(ctx, `UPDATE app.effect_records SET state = 'CANCELLED', updated_at = now()
+ 		WHERE business_op_id = $1 AND tenant_id = $2 AND state = 'PENDING'`,
+ 		opID, tenantID)
+ 	if err != nil {
+-		return false
++		return false, err
+ 	}
+-	return tag.RowsAffected() == 1
++	return tag.RowsAffected() == 1, nil
+ }
+ 
+ // transitionAuthorized performs the step-5 predicated effect
+@@ -475,21 +585,18 @@
+ 	return hit, nil
+ }
+ 
+-// auditRefusal best-effort records a refusal after the
+-// authorization transaction ends (rollback for pure refusals,
+-// commit for withdrawals — either way the audit cannot ride
+-// that tx). A nil auditor skips silently; production and
+-// refusal-asserting tests always wire one.
+-func (s *Service) auditRefusal(ctx context.Context, tenantID string, intent Intent, inv invocationAuth, reason string, withdrawn bool) {
++// auditRefusal best-effort records a refusal after a rolled-back
++// authorization transaction. Terminal-invocation decisions audit
++// inside that transaction instead (see terminalWithdrawTx), so
++// this path only ever emits effect-refused. A nil auditor skips
++// silently; production and refusal-asserting tests always wire one.
++func (s *Service) auditRefusal(ctx context.Context, tenantID string, intent Intent, inv invocationAuth, reason string) {
+ 	// Unattributable (invocation never loaded) or unwired
+ 	// auditor: skip rather than fabricate attribution.
+ 	if s.auditor == nil || inv.miniapp == "" || inv.tool == "" {
+ 		return
+ 	}
+-	action, result := "effect-refused", "refused"
+-	if withdrawn {
+-		action, result = "effect-withdrawn", "withdrawn"
+-	}
++	const action, result = "effect-refused", "refused"
+ 	details, _ := json.Marshal(map[string]any{
+ 		"business_op_id": intent.BusinessOpID,
+ 		"invocation_id":  intent.InvocationID,

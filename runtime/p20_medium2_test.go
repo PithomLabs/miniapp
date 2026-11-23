@@ -76,17 +76,17 @@ func (g *p20bGate) shutdown() {
 	g.once.Do(func() { close(g.release) })
 }
 
-func p20bPolicy() auth.Policy {
-	return auth.Policy{
-		Keys: map[string]auth.Binding{
+func p20bPolicy() *auth.Policy {
+	return auth.NewPolicy(
+		map[string]auth.Binding{
 			credAgentA: {AgentID: "agent-a", Authority: contract.Authority{
 				Kind: contract.AuthorityUser, ID: "agent-a", TenantID: tenantA,
 			}},
 		},
-		Grants: map[string]map[string]contract.TrustMode{
+		map[string]map[string]contract.TrustMode{
 			tenantA: {p20bMiniapp: contract.TrustAutonomous},
 		},
-	}
+	)
 }
 
 type p20bFixture struct {
@@ -108,15 +108,18 @@ func newP20bFixture(t *testing.T, db *testkit.DB, handler registry.ToolFunc) p20
 	}
 	async := &fakeAsync{status: map[string]contract.RunStatus{}}
 	policy := p20bPolicy()
+	aud := audit.New(db.Pool, nil)
+	approver := approvals.New(db.Pool)
 	effSvc := effects.New(effects.Config{Pool: db.Pool,
 		Channels:  map[string]effects.Channel{"mock": mockcap.New(db.Pool)},
 		Canceller: runtime.EffectCanceller(db.Pool),
 		Policy:    effects.StrictPolicy{Pool: db.Pool, Registry: reg, Grants: policy},
+		Registry:  reg, Grants: policy, Approver: approver, Auditor: aud,
 	})
 	svc, err := runtime.New(runtime.Config{
 		Registry: reg, Policy: policy, Pool: db.Pool,
 		Sync: classa.New(db.Pool, reg), Async: async,
-		Approver: approvals.New(db.Pool), Auditor: audit.New(db.Pool, nil), Effects: effSvc,
+		Approver: approver, Auditor: aud, Effects: effSvc,
 	})
 	if err != nil {
 		t.Fatal(err)

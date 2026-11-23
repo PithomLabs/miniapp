@@ -1,0 +1,12 @@
+--- /tmp/p25_red10/runtime/service.go	2026-11-23 22:26:06.802071487 +0800
++++ runtime/service.go	2026-11-23 22:25:47.857221114 +0800
+@@ -714,7 +714,8 @@
+ 		// recorded). Terminal conflict; the retry instruction
+ 		// follows replay semantics for this record (C6).
+ 		return InvokeResult{}, terminal("effect-contention",
+-			"another attempt owns the effect for invocation %s; retry with the same idempotency key", rec.ID)
++			"another attempt owns the effect for invocation %s; %s", rec.ID,
++			contentionRetryHint(rec.Status, tool.Class))
+ 	}
+ 	if errors.Is(err, executor.ErrExecutionSuperseded) {
+ 		// Rolled back before committing anything: reload and

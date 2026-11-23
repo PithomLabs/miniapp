@@ -9,12 +9,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/PithomLabs/miniapp/contract"
+	"github.com/PithomLabs/miniapp/internal/store"
 	"github.com/PithomLabs/miniapp/testkit"
 )
+
+// completeTxWon drives the live completion op inside a tenant
+// transaction (P21-001: completeIfLive deleted; completeTx is the
+// sole completion).
+func completeTxWon(t *testing.T, s *invocations, tenant, id string, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
+	t.Helper()
+	return store.WithTenant(context.Background(), s.pool, tenant, func(tx pgx.Tx) (bool, error) {
+		return s.completeTx(context.Background(), tx, tenant, id, status, result, errMsg)
+	})
+}
 
 func claimRow(t *testing.T, s *invocations, tenant, key, initial string) invocation {
 	t.Helper()
@@ -60,8 +72,8 @@ func TestPredicatedOpsRejectCrossTenant(t *testing.T) {
 	waiting := claimRow(t, s, "tenant-a", "k2", string(contract.RunWaitingApproval))
 
 	// Cross-tenant attempts on the running row: all lose.
-	if won, err := s.completeIfLive(ctx, "tenant-b", running.ID, contract.RunSucceeded, json.RawMessage(`{}`), ""); err != nil || won {
-		t.Fatalf("cross-tenant completeIfLive = %v, %v; want false, nil", won, err)
+	if won, err := completeTxWon(t, s, "tenant-b", running.ID, contract.RunSucceeded, json.RawMessage(`{}`), ""); err != nil || won {
+		t.Fatalf("cross-tenant completeTx = %v, %v; want false, nil", won, err)
 	}
 	if won, err := s.syncIfLive(ctx, "tenant-b", running.ID, contract.RunSucceeded); err != nil || won {
 		t.Fatalf("cross-tenant syncIfLive = %v, %v; want false, nil", won, err)
@@ -78,8 +90,8 @@ func TestPredicatedOpsRejectCrossTenant(t *testing.T) {
 	if won, err := s.failIfWaiting(ctx, "tenant-b", waiting.ID, "", "x"); err != nil || won {
 		t.Fatalf("cross-tenant failIfWaiting(waiting) = %v, %v; want false, nil", won, err)
 	}
-	if won, err := s.completeIfLive(ctx, "tenant-b", waiting.ID, contract.RunSucceeded, json.RawMessage(`{}`), ""); err != nil || won {
-		t.Fatalf("cross-tenant completeIfLive(waiting) = %v, %v; want false, nil", won, err)
+	if won, err := completeTxWon(t, s, "tenant-b", waiting.ID, contract.RunSucceeded, json.RawMessage(`{}`), ""); err != nil || won {
+		t.Fatalf("cross-tenant completeTx(waiting) = %v, %v; want false, nil", won, err)
 	}
 	for _, tc := range []struct {
 		id   string
@@ -94,8 +106,8 @@ func TestPredicatedOpsRejectCrossTenant(t *testing.T) {
 		}
 	}
 	// Own-tenant controls: both ops win from their live states.
-	if won, err := s.completeIfLive(ctx, "tenant-a", running.ID, contract.RunSucceeded, json.RawMessage(`{"ok":true}`), ""); err != nil || !won {
-		t.Fatalf("own-tenant completeIfLive = %v, %v; want true, nil", won, err)
+	if won, err := completeTxWon(t, s, "tenant-a", running.ID, contract.RunSucceeded, json.RawMessage(`{"ok":true}`), ""); err != nil || !won {
+		t.Fatalf("own-tenant completeTx = %v, %v; want true, nil", won, err)
 	}
 	if won, err := s.failIfWaiting(ctx, "tenant-a", waiting.ID, "", "denied"); err != nil || !won {
 		t.Fatalf("own-tenant failIfWaiting = %v, %v; want true, nil", won, err)
@@ -139,8 +151,8 @@ func TestPredicatedOpsFromStates(t *testing.T) {
 	}
 	// Terminal record: every op loses, nothing changes.
 	for name, op := range map[string]func() (bool, error){
-		"completeIfLive": func() (bool, error) {
-			return s.completeIfLive(ctx, "tenant-a", running.ID, contract.RunFailed, json.RawMessage(`{}`), "late")
+		"completeTx": func() (bool, error) {
+			return completeTxWon(t, s, "tenant-a", running.ID, contract.RunFailed, json.RawMessage(`{}`), "late")
 		},
 		"syncIfLive": func() (bool, error) {
 			return s.syncIfLive(ctx, "tenant-a", running.ID, contract.RunCancelled)
@@ -187,8 +199,8 @@ func TestPredicatedOpsFromStates(t *testing.T) {
 		"cancelIfLive": func() (bool, error) {
 			return s.cancelIfLive(ctx, "tenant-a", quar.ID, "", "x")
 		},
-		"completeIfLive": func() (bool, error) {
-			return s.completeIfLive(ctx, "tenant-a", quar.ID, contract.RunSucceeded, json.RawMessage(`{}`), "")
+		"completeTx": func() (bool, error) {
+			return completeTxWon(t, s, "tenant-a", quar.ID, contract.RunSucceeded, json.RawMessage(`{}`), "")
 		},
 		"syncIfLive": func() (bool, error) {
 			return s.syncIfLive(ctx, "tenant-a", quar.ID, contract.RunSucceeded)
@@ -285,8 +297,8 @@ func TestPredicatedOpsRejectCrossTenantBypassRole(t *testing.T) {
 		t.Fatalf("bypass role cannot read row (RLS not bypassed?): %v", err)
 	}
 	bs := &invocations{pool: bypassPool}
-	if won, err := bs.completeIfLive(ctx, "tenant-b", running.ID, contract.RunSucceeded, json.RawMessage(`{}`), ""); err != nil || won {
-		t.Fatalf("bypass completeIfLive = %v, %v; want false, nil", won, err)
+	if won, err := completeTxWon(t, bs, "tenant-b", running.ID, contract.RunSucceeded, json.RawMessage(`{}`), ""); err != nil || won {
+		t.Fatalf("bypass completeTx = %v, %v; want false, nil", won, err)
 	}
 	if won, err := bs.syncIfLive(ctx, "tenant-b", running.ID, contract.RunSucceeded); err != nil || won {
 		t.Fatalf("bypass syncIfLive = %v, %v; want false, nil", won, err)

@@ -79,15 +79,17 @@ const (
 
 // ValidEffectTransitions is the frozen effect state machine. UNKNOWN
 // never transitions directly back to ATTEMPTING: reconciliation must
-// establish the outcome first.
+// establish the outcome first. Settlement is atomic (UNKNOWN
+// straight to terminal in one transaction with its audit);
+// RECONCILING is retired: the constant stays for stored data
+// compatibility, but no edge enters or leaves it.
 var ValidEffectTransitions = map[EffectState][]EffectState{
-	EffectPending:     {EffectAttempting, EffectCancelled()},
-	EffectAttempting:  {EffectConfirmed, EffectFailed, EffectUnknown},
-	EffectUnknown:     {EffectReconciling},
-	EffectReconciling: {EffectConfirmed, EffectNotApplied, EffectFailed},
-	EffectConfirmed:   {},
-	EffectFailed:      {},
-	EffectNotApplied:  {EffectAttempting},
+	EffectPending:    {EffectAttempting, EffectCancelled()},
+	EffectAttempting: {EffectConfirmed, EffectFailed, EffectUnknown},
+	EffectUnknown:    {EffectConfirmed, EffectFailed, EffectNotApplied},
+	EffectConfirmed:  {},
+	EffectFailed:     {},
+	EffectNotApplied: {EffectAttempting},
 }
 
 // EffectCancelled is a sentinel for intents withdrawn before dispatch.
@@ -105,6 +107,10 @@ type EffectRecord struct {
 	ProviderRequest string      `json:"providerRequestId,omitempty"`
 	ProviderReply   string      `json:"providerReplyRef,omitempty"`
 	UpdatedAt       time.Time   `json:"updatedAt,omitempty"`
+	// InvocationID binds the effect to its authorizing
+	// invocation. Authoritative reads populate it; the
+	// authorization boundary refuses binding mismatches.
+	InvocationID string `json:"invocationId,omitempty"`
 }
 
 // Transition moves the record to the next state when the machine allows
