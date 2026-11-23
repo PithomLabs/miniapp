@@ -40,9 +40,21 @@ func (s *Service) Status(ctx context.Context, credential, invocationID string) (
 			live, err := s.cfg.Async.Status(ctx, rec.RunID)
 			if err != nil {
 				out.Stale = true
+			} else if won, serr := s.store.syncIfLive(ctx, tenantID, rec.ID, live); serr != nil {
+				out.Stale = true
+			} else if !won {
+				// Lost to a concurrent terminal transition:
+				// answer from the recorded state instead of the
+				// stale observation, and audit nothing (the
+				// winner owns the settlement record).
+				if fresh, ferr := s.store.getByID(ctx, tenantID, rec.ID); ferr == nil {
+					status = fresh.Status
+					out.Result = fresh.Result
+				} else {
+					out.Stale = true
+				}
 			} else {
 				status = live
-				_ = s.store.update(ctx, tenantID, rec.ID, live, nil, rec.RunID, "")
 				if live == contract.RunSucceeded || live == contract.RunFailed || live == contract.RunCancelled {
 					// Settlement audit failures propagate (retryable) so a
 					// failed audit is never silently mistaken for a
@@ -130,8 +142,21 @@ func (s *Service) Cancel(ctx context.Context, credential, runID, reason string) 
 	if reason == "" {
 		reason = "cancelled by operator"
 	}
-	if err := s.store.update(ctx, tenantID, rec.ID, contract.RunCancelled, nil, rec.RunID, reason); err != nil {
+	won, err := s.store.cancelIfLive(ctx, tenantID, rec.ID, rec.RunID, reason)
+	if err != nil {
 		return CancelResult{}, retryable("store-unavailable", "%v", err)
+	}
+	if !won {
+		// Lost to a concurrent terminal transition: route on
+		// fresh state instead of overwriting the winner.
+		fresh, err := s.store.getByID(ctx, tenantID, rec.ID)
+		if err != nil {
+			return CancelResult{}, retryable("store-unavailable", "%v", err)
+		}
+		if fresh.Status == contract.RunCancelled {
+			return s.redeliverCancel(ctx, binding, fresh)
+		}
+		return CancelResult{}, terminal("run-not-live", "run is %s", fresh.Status)
 	}
 	if err := s.settleCancel(ctx, binding, rec, reason); err != nil {
 		return CancelResult{}, err

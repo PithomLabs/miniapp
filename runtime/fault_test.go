@@ -360,6 +360,68 @@ func TestFaultCompletionAudit(t *testing.T) {
 	}
 }
 
+// TestFaultClaimResponse (L-01): a lost success response after the
+// claim commit surfaces retryable; the same-key retry converges
+// through replay on the SAME record — one invocation row, one
+// canonical run, coherent audits (duplicate marker, no second
+// dispatched event).
+func TestFaultClaimResponse(t *testing.T) {
+	db := newDB(t)
+	fx := newFixture(t, db)
+	inj := fault.New()
+	inj.FailAt("claim-response", 1, errFault)
+	fx.svc.TestFault = inj
+
+	if _, err := invoke(fx.svc, probeID, probeTool, `{}`, "key-fclaim", credAgentA, contract.TrustAutonomous); err == nil {
+		t.Fatal("first invoke succeeded despite injected lost response")
+	}
+	if n := inj.Count("claim-response"); n != 1 {
+		t.Fatalf("fired %d times, want 1", n)
+	}
+	out, err := invoke(fx.svc, probeID, probeTool, `{}`, "key-fclaim", credAgentA, contract.TrustAutonomous)
+	if err != nil || out.Status != contract.RunRunning || out.Handle == nil {
+		t.Fatalf("retry = %+v, %v; want converged Running handle", out, err)
+	}
+	var rows int
+	_, err = store.WithTenant(context.Background(), db.Pool, tenantA, func(tx pgx.Tx) (bool, error) {
+		err := tx.QueryRow(context.Background(),
+			`SELECT count(*) FROM app.invocations WHERE idempotency_key = 'key-fclaim'`).Scan(&rows)
+		return true, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("invocation rows = %d, want exactly 1 (no second claim)", rows)
+	}
+	fx.async.mu.Lock()
+	defer fx.async.mu.Unlock()
+	if len(fx.async.status) != 1 {
+		t.Fatalf("executor runs = %d, want exactly 1 (no second run)", len(fx.async.status))
+	}
+	var disp, dup int
+	_, err = store.WithTenant(context.Background(), db.Pool, tenantA, func(tx pgx.Tx) (bool, error) {
+		err := tx.QueryRow(context.Background(),
+			`SELECT count(*) FROM app.audit_events WHERE action = 'invoke' AND outcome = 'dispatched'`).Scan(&disp)
+		if err != nil {
+			return false, err
+		}
+		err = tx.QueryRow(context.Background(),
+			`SELECT count(*) FROM app.audit_events WHERE action = 'invoke' AND outcome = 'duplicate'`).Scan(&dup)
+		return true, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Coherent chain for response-loss recovery: the retry is a
+	// replay, so it emits the duplicate marker rather than a
+	// second dispatched event (dispatch audits first-claim only);
+	// the single run plus its settlement complete the chain.
+	if disp != 0 || dup != 1 {
+		t.Fatalf("dispatched = %d, duplicate = %d; want 0 and 1", disp, dup)
+	}
+}
+
 // TestApprovalRetryAfterSubmitFailure (X-01 trigger a): approval
 // creation fails once; the same-key retry parks cleanly and the
 // Class D submit carries the parked linkage — never a blind

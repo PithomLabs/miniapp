@@ -1,8 +1,10 @@
 name: ci
 
-# Phase 0 CI skeleton: build, vet, and tests with strict policy mode.
-# Unverified until the first push runs it; local `go test ./...` covers
-# the same gates meanwhile. Runners need Go 1.26+ and no overrides.
+# Build, vet, and tests with strict policy mode. Integration tests run
+# against the postgres service below (same major as local development:
+# keep image in sync with POSTGRES_IMAGE in compose.yaml /
+# Taskfile.dev.yml). Test packages run serially (-p 1): they share one
+# database and truncate tables, so parallel packages interfere.
 
 on:
   push:
@@ -11,9 +13,25 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:19.0
+        env:
+          POSTGRES_USER: miniapp
+          POSTGRES_PASSWORD: miniapp-ci
+          POSTGRES_DB: miniapp_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       MINIAPP_POLICY: strict
       CI: "true"
+      TEST_DATABASE_URL: postgres://miniapp:miniapp-ci@localhost:5432/miniapp_dev
+      TEST_DBOS_DATABASE_URL: postgres://miniapp:miniapp-ci@localhost:5432/miniapp_dev
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -22,6 +40,12 @@ jobs:
           cache: true
       - run: out=$(gofmt -l .); rc=$?; if [ $rc -ne 0 ]; then echo "gofmt execution failed"; exit $rc; fi; test -z "$out"
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -p 1 ./...
+      - name: restart tests must execute (not skip)
+        run: |
+          out=$(go test ./executor/dbos/ -run 'TestSleepAcrossRestart' -count=1 -v 2>&1)
+          echo "$out" | grep -q -- '--- PASS: TestSleepAcrossRestart' || { echo "$out"; exit 1; }
+          out=$(go test ./probe/classd/ -run 'TestProbeRestart' -count=1 -v 2>&1)
+          echo "$out" | grep -q -- '--- PASS: TestProbeRestart' || { echo "$out"; exit 1; }
       - run: go test -race ./contract/ ./internal/... ./spikes/
       - run: bash scripts/checks.sh

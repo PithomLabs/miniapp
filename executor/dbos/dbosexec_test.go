@@ -776,15 +776,16 @@ func TestSleepWorker(t *testing.T) {
 // TestSleepAcrossRestart kills a worker mid-sleep, relaunches, and
 // proves the wait resumes and completes exactly once.
 func TestSleepAcrossRestart(t *testing.T) {
+	testkit.RequireDB(t, "TEST_DBOS_DATABASE_URL")
 	dir := t.TempDir()
 	marker := fmt.Sprintf("sleepkill-%d", time.Now().UnixNano())
-	cmd := testkit.SpawnWorker(t, "TestSleepWorker", map[string]string{
+	w := testkit.SpawnWorker(t, "TestSleepWorker", map[string]string{
 		sleepWorkerEnv: "1", "MINIAPP_SLEEP_DIR": dir, "MINIAPP_SLEEP_MARKER": marker,
 	})
-	testkit.WaitForFile(t, cmd, filepath.Join(dir, "submitted"), 2*time.Minute)
+	testkit.WaitForFile(t, w, filepath.Join(dir, "submitted"), 2*time.Minute)
 	time.Sleep(2 * time.Second)
 	killAt := time.Now()
-	testkit.Kill9(t, cmd)
+	testkit.Kill9(t, w)
 
 	h := newHarness(t, "1")
 	handle, err := h.ex.Submit(context.Background(), sleepReq(marker, 15000))

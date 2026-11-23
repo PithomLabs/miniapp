@@ -585,16 +585,17 @@ func TestProbeCrashWorker(t *testing.T) {
 }
 
 func TestProbeRestart(t *testing.T) {
+	testkit.RequireDB(t, "TEST_DATABASE_URL")
 	dir := t.TempDir()
 	subject := fmt.Sprintf("restart-%d", time.Now().UnixNano())
 	key := "key-probe-restart"
-	cmd := testkit.SpawnWorker(t, "TestProbeCrashWorker", map[string]string{
+	w := testkit.SpawnWorker(t, "TestProbeCrashWorker", map[string]string{
 		probeWorkerEnv: "1", "MINIAPP_PROBE_DIR": dir,
 		"MINIAPP_PROBE_SUBJECT": subject, "MINIAPP_PROBE_KEY": key,
 	})
-	testkit.WaitForFile(t, cmd, filepath.Join(dir, "submitted"), 2*time.Minute)
+	testkit.WaitForFile(t, w, filepath.Join(dir, "submitted"), 2*time.Minute)
 	time.Sleep(2 * time.Second)
-	testkit.Kill9(t, cmd)
+	testkit.Kill9(t, w)
 
 	fx := reStack(t)
 	out, err := invokeProbe(t, fx, classd.ToolOpen, subject, key, credProber, map[string]any{

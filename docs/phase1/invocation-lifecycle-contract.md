@@ -236,8 +236,32 @@ per CR-04 — sequence, policy-control, and grant rows added):
    before the PG transaction begins).
 5. Effect row (`app.effect_records`, predicated `UPDATE` /
    conditional `INSERT`).
-6. Advisory entity lock (Class A serialization; leaf — never held
-   while acquiring 1–5).
+6. Advisory entity locks are acquired outermost-first, before
+   acquiring transactional row or table locks. An advisory lock
+   must never be acquired while holding those transactional
+   locks. Once acquired, it may remain held while the protected
+   operation obtains its subsequent database locks, subject to
+   the established release and failure semantics. (Owner-approved
+   WS-B correction; the previous "leaf" wording was reversed —
+   see §16. Class A holds its entity lock across handler
+   `Perform` calls by design; the no-cycle proof below covers
+   that nesting.)
+
+No-cycle proof (from the actual call graph): (a) exactly one
+production site acquires advisory locks —
+`executor/classa/classa.go:41`, always as the first lock operation
+in a fresh transaction (verified: `LockEntity` precedes all
+handler work; `executeSync`/`dispatch` hold no PG locks across
+the call); Class B/C/D, runtime, approvals, effects, and sweeper
+paths never acquire advisory locks (exhaustive grep). (b) Hence
+no path acquires an advisory lock while holding PG row/table
+locks. (c) Advisory waiters hold no PG locks (they block before
+their handler runs), so a holder — waiting only on PG locks
+ordered by §4.2 — can never wait transitively on its own
+waiters. Same-key serialization resolves as holders commit.
+(d) Nested `Perform` calls inside a Class A handler acquire PG
+locks 1→5 while the advisory lock is held; with (a)–(c) this
+adds no cycle. QED.
 
 Consequences: the authorization transaction takes 1→2→3→4→5 in
 order; `Cancel` takes 1, then settles approvals (2) and withdraws
@@ -708,6 +732,7 @@ Final op inventory (each with a firing/boundary/propagation test):
 | `park-update` | `requestApproval` pre-park | rollback (nothing parked) |
 | `audit:approval-requested` | service audit choke | park stands, audit missing → retryable |
 | `runid-persist` | `submitRecorded` + `confirmSubmit` pre-update | rollback (no run recorded, no submit) |
+| `claim-response` | `Invoke` post-claim-commit, pre-dispatch | lost response → retry converges on same record (L-01) |
 | `async-submit` | wrapper pre-`Submit` | run persisted, submit failed (X-02 setup) |
 | `decide-commit` | `Decide` post-validation, pre-UPDATE | rollback (stays pending) |
 | `decide-response` | `Decide` post-commit, pre-return | commit stands; identical retry converges |
@@ -811,16 +836,21 @@ disposition — a matrix update alone is not sufficient.
   audit tables already carry the needed columns; refusal and
   settlement records are audit-vocabulary extensions.
 - **000006 data preflight (CR-07, runs BEFORE the constraint):**
-  scan for duplicate nonempty `run_id`; scan identity fields for
-  `%`/`:`; check escape collisions. P1 evidence (read-only,
-  recorded in the register): local `miniapp_dev` — 0 duplicates,
-  0 tenant delimiters, 1 expected multi-colon probe op ID;
-  Neon `phase0/g0-spikes` — 6 app tables, 0 duplicates, all scans
-  0. P2 upgrade fixtures deliberately contain duplicate run IDs
-  and delimiter-bearing IDs; on detection the migration fails
-  with an actionable diagnostic (never silently picks an owner
-  or rewrites identities) or runs an explicitly authorized
-  deterministic remediation. No shared/production Neon mutation.
+  the migration detects duplicate nonempty `run_id` values and
+  fails with an actionable diagnostic listing them (never
+  silently picks an owner). Delimiter-bearing IDs are NOT
+  scanned or rejected: `ScopeID` percent-encoding is injective
+  (both parts `:`-free after escaping, so the join has exactly
+  one separator), making escape collisions impossible, and
+  legacy delimiter-bearing rows coexist compatibly (corrected
+  per L-02 — the earlier "scan identity fields / check escape
+  collisions" wording described a reject-on-delimiter design that
+  was replaced; see §16). The P1 read-only scans (local: 0
+  duplicates, 0 tenant delimiters, 1 expected multi-colon probe
+  op ID; Neon: 0/0) were design reconnaissance, not migration
+  gates. Upgrade fixtures deliberately contain duplicate run IDs
+  (diagnostic asserted) and delimiter-bearing IDs (upgrade
+  asserted to SUCCEED). No shared/production Neon mutation.
 - **Roles/REVOKEs (X-15)** ship as a documented deployment step, not
   migration content (roles are project-global on Neon; the migration
   stays branch-local): restricted app role (`SELECT` on
@@ -845,8 +875,15 @@ disposition — a matrix update alone is not sufficient.
   SQL caller. The ordinary runtime connects as the restricted
   role, including in local integration tests.
 - **X-19 compatibility:** the escape is identity for IDs without
-  `%`/`:` (all existing rows); persisted `BusinessOpID` lookups keep
-  working; collision-pair test covers the new behavior.
+  `%`/`:`; collision-pair test covers the new behavior. Legacy
+  raw multi-colon rows are ORPHANED on re-attempt, never matched
+  again: a post-upgrade lookup computes the escaped PK, misses
+  the raw row, and inserts a fresh row (corrected per L-03 — the
+  earlier "lookups keep working" was strictly false). This is
+  safe ONLY because no production rows exist (test databases
+  re-seed; old invocations are terminal and never re-attempted).
+  Standing rule: any future encoding change with production data
+  present requires dual-read or backfill before cutover.
 - **Operator `settle` verb (F-03 Settle disposition, doc-spec only —
   P2 implements):** `miniapp settle --op <business-op-id> --to
   <confirmed|failed|not-applied> --note <evidence>`; authenticates
@@ -965,6 +1002,14 @@ source file was modified; only this document and evidence changed.
 | WS-A 000006/7 | Migration split by workstream (identity vs control plane) | Clear migration ownership per §20 | §12 | `TestMigration000006*` (fresh, dup-diagnostic, delimiter-compat) | 000007 lands in WS-F |
 | WS-A Rule-3 interpretation | Choke requires LIVE linkage (pending/granted), not granted-only | Original §2/§5.3 wording ("granted approval linkage") forbids the reviewed park-submit-wait flow: park submits bound to a PENDING approval; granted-only would force an architecture redesign (submit-on-grant, obsoleting the signal bridge and sweeper S1) — explicitly forbidden. Prompt 15.2's mechanics (S1 redelivery to waiting runs, X-02 submit-if-missing-before-poll, workflow wait + fail-closed-on-missing) all presume pending-linkage submits. Reading "ungranted" as "not covered by a live approval process" | §2 Rule 3, §5 step 3 | X-01/X-02 discriminators (submit bound to pending linkage; missing/denied/expired refused) | OWNER-APPROVED with narrowing (wsc_exit_a_review_plan.md): two permissions recorded verbatim in §2/§5; effect-boundary revalidation specified now, implemented in WS-B |
 | WS-A Rule-3 amendment | Two permissions normative (workflow-start vs business-execution) + authorize-tx verification list | Exit review required the narrowed amendment + owner decision | §2, §5 | entry-path wait proofs (Phase 2); effect test lands in WS-B | none — WS-A proves admission+waiting only, never claims the effect guarantee |
+| WS-B advisory | §4 advisory rule corrected to outermost-first + no-cycle proof (was: "leaf, never held while acquiring") | Old wording reversed the actual Class A order (lock held across handler `Perform` calls); owner-approved exact wording adopted | §4 | call-graph proof (single acquirer, first statement; no other acquirers) | none |
+| WS-B L-01 | `claim-response` op implemented as specified (§9 row added) | Was specified but absent (review L-01) | §9 | `TestFaultClaimResponse` (one-shot, replay convergence, single run, audit coherence) | none |
+| WS-B L-02 | §12 preflight wording: dup-only detection + delimiter compat | Described a replaced reject-on-delimiter design | §12 | existing migration tests (dup-diagnostic + delimiter-compat-SUCCEEDS) | none — wording only |
+| WS-B L-03 | §12 compat: legacy raw rows orphaned on re-attempt + dual-read/backfill standing rule | "Lookups keep working" strictly false for multi-colon legacy rows | §12 | existing compat test; no prod rows exist | future encoding changes gated |
+| WS-B O-05 | `testkit` doc notes the serial `-p 1` requirement | Methodology was tribal knowledge | testkit/doc.go | none (doc only) | none |
+| WS-B L-02 | §12 preflight wording: dup-only detection + delimiter compat (was: reject-on-delimiter scanning) | Contract described a design that was replaced; migration never scanned delimiters | §12 | existing `TestMigration000006*` (dup-diagnostic + delimiter-compat-SUCCEEDS) | none — wording only |
+| WS-B L-03 | §12 compatibility: legacy raw rows orphaned on re-attempt + dual-read/backfill standing rule (was: "lookups keep working") | Strictly false for multi-colon legacy rows under the escaped PK | §12 | existing compat test (upgrade succeeds); no prod rows exist | future encoding changes gated on the standing rule |
+| WS-B advisory | §4 advisory rule corrected to outermost-first + no-cycle proof (was: "leaf, never held while acquiring") | Old wording reversed the actual Class A order (lock held across handler `Perform` calls) | §4 | no new test (call-graph proof; covered by existing Class A + effects suites) | none |
 
 No new architectural conflicts discovered. No owner decision
 invented. OpenCode remains NOT RUN/BLOCKED (unchanged, non-blocking).

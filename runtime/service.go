@@ -173,6 +173,13 @@ func (s *Service) Invoke(ctx context.Context, req InvokeRequest) (InvokeResult, 
 	if !created {
 		return s.replay(ctx, req, binding, tool, rec)
 	}
+	// claim-response models a lost success response after the claim
+	// commit: the row stands, the caller retries, and the retry
+	// converges through replay on the same record — never a second
+	// run. One-shot per the fault-injection contract.
+	if err := s.TestFault.Fire("claim-response"); err != nil {
+		return InvokeResult{}, retryable("store-unavailable", "%v", err)
+	}
 	if decision == auth.NeedsApproval {
 		return s.requestApproval(ctx, req, binding, tool, rec)
 	}
@@ -371,27 +378,22 @@ func (s *Service) pollApproval(ctx context.Context, req InvokeRequest, binding a
 			if err := s.settleDenied(ctx, rec, "approval denied"); err != nil {
 				return InvokeResult{}, err
 			}
-			s.store.update(ctx, tenantID, rec.ID, contract.RunFailed, nil, rec.RunID, "approval denied")
-			s.auditBestEffort(ctx, req, binding, "approval-denied", "denied", rec.ID)
-			return InvokeResult{}, terminal("approval-denied", "the approval request was denied")
+			return s.settlePollTerminal(ctx, req, binding, tool, rec, "denied")
 		}
 		if tool.Class == contract.ClassD {
 			return s.grantedRun(ctx, req, binding, rec)
 		}
-		return s.executeSync(ctx, req, binding, rec)
+		return s.executeSync(ctx, req, binding, tool, rec)
 	case "expired":
 		if err := s.settleDenied(ctx, rec, "approval expired"); err != nil {
 			return InvokeResult{}, err
 		}
-		s.store.update(ctx, tenantID, rec.ID, contract.RunFailed, nil, rec.RunID, "approval expired")
-		s.auditBestEffort(ctx, req, binding, "approval-expired", "expired", rec.ID)
-		return InvokeResult{}, terminal("approval-expired", "the approval request expired")
+		return s.settlePollTerminal(ctx, req, binding, tool, rec, "expired")
 	case "cancelled":
 		if err := s.settleDenied(ctx, rec, "approval cancelled"); err != nil {
 			return InvokeResult{}, err
 		}
-		s.store.update(ctx, tenantID, rec.ID, contract.RunFailed, nil, rec.RunID, "approval cancelled")
-		return InvokeResult{}, terminal("approval-cancelled", "the approval was cancelled")
+		return s.settlePollTerminal(ctx, req, binding, tool, rec, "cancelled")
 	default:
 		return InvokeResult{InvocationID: rec.ID, Status: contract.RunWaitingApproval, ApprovalID: appr.ID}, nil
 	}
@@ -426,6 +428,38 @@ func (s *Service) grantedRun(ctx context.Context, req InvokeRequest, binding aut
 		return InvokeResult{InvocationID: rec.ID, Status: status, Handle: &handle}, nil
 	}
 	return InvokeResult{InvocationID: rec.ID, Status: status, Handle: s.handleFor(req, rec.RunID, status)}, nil
+}
+
+// settlePollTerminal records a poll settlement (denied, expired,
+// or approval-cancelled) from the waiting state only. On losing
+// the transition race it reloads and replays on fresh state, so
+// the caller always answers from the recorded terminal — never by
+// overwriting a concurrent winner. The approval-cancelled branch
+// stays unaudited here because Cancel already audited the
+// cancellation.
+func (s *Service) settlePollTerminal(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation, outcome string) (InvokeResult, error) {
+	tenantID := binding.Authority.TenantID
+	won, err := s.store.failIfWaiting(ctx, tenantID, rec.ID, rec.RunID, "approval "+outcome)
+	if err != nil {
+		return InvokeResult{}, retryable("store-unavailable", "%v", err)
+	}
+	if !won {
+		fresh, err := s.store.getByID(ctx, tenantID, rec.ID)
+		if err != nil {
+			return InvokeResult{}, retryable("store-unavailable", "%v", err)
+		}
+		return s.replay(ctx, req, binding, tool, fresh)
+	}
+	switch outcome {
+	case "denied":
+		s.auditBestEffort(ctx, req, binding, "approval-denied", "denied", rec.ID)
+		return InvokeResult{}, terminal("approval-denied", "the approval request was denied")
+	case "expired":
+		s.auditBestEffort(ctx, req, binding, "approval-expired", "expired", rec.ID)
+		return InvokeResult{}, terminal("approval-expired", "the approval request expired")
+	default:
+		return InvokeResult{}, terminal("approval-cancelled", "the approval was cancelled")
+	}
 }
 
 // settleDenied stops the live run behind a terminally non-approved
@@ -473,7 +507,7 @@ func (s *Service) dispatch(ctx context.Context, req InvokeRequest, binding auth.
 		}
 		return InvokeResult{InvocationID: rec.ID, Status: contract.RunRunning, Handle: &handle}, nil
 	}
-	return s.executeSync(ctx, req, binding, rec)
+	return s.executeSync(ctx, req, binding, tool, rec)
 }
 
 // errApprovalRequired signals that a gated tool reached submission
@@ -601,16 +635,35 @@ func (s *Service) toolFor(req InvokeRequest) (contract.ToolManifest, error) {
 	return tool, nil
 }
 
-func (s *Service) executeSync(ctx context.Context, req InvokeRequest, binding auth.Binding, rec invocation) (InvokeResult, error) {
-	tenantID := binding.Authority.TenantID
+func (s *Service) executeSync(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation) (InvokeResult, error) {
 	result, err := s.cfg.Sync.Execute(ctx, s.executorRequest(req, binding, rec, ""))
 	if err != nil {
-		s.store.update(ctx, tenantID, rec.ID, contract.RunFailed, nil, "", err.Error())
-		s.auditBestEffort(ctx, req, binding, "invoke", "failed", rec.ID)
-		return InvokeResult{}, terminal("execution-failed", "%v", err)
+		return s.completeSync(ctx, req, binding, tool, rec, contract.RunFailed, nil, err.Error())
 	}
-	if err := s.store.update(ctx, tenantID, rec.ID, contract.RunSucceeded, result, "", ""); err != nil {
+	return s.completeSync(ctx, req, binding, tool, rec, contract.RunSucceeded, result, "")
+}
+
+// completeSync records a synchronous completion from a live state
+// only. On losing the transition race (notably to a concurrent
+// Cancel) it reloads and replays on fresh state: the handler
+// result is discarded rather than overwriting cancellation, and
+// the caller learns the recorded terminal.
+func (s *Service) completeSync(ctx context.Context, req InvokeRequest, binding auth.Binding, tool contract.ToolManifest, rec invocation, status contract.RunStatus, result json.RawMessage, errMsg string) (InvokeResult, error) {
+	tenantID := binding.Authority.TenantID
+	won, err := s.store.completeIfLive(ctx, tenantID, rec.ID, status, result, errMsg)
+	if err != nil {
 		return InvokeResult{}, retryable("store-unavailable", "%v", err)
+	}
+	if !won {
+		fresh, err := s.store.getByID(ctx, tenantID, rec.ID)
+		if err != nil {
+			return InvokeResult{}, retryable("store-unavailable", "%v", err)
+		}
+		return s.replay(ctx, req, binding, tool, fresh)
+	}
+	if status == contract.RunFailed {
+		s.auditBestEffort(ctx, req, binding, "invoke", "failed", rec.ID)
+		return InvokeResult{}, terminal("execution-failed", "%v", errMsg)
 	}
 	if err := s.audit(ctx, req, binding, "invoke", "succeeded", rec.ID, "", nil); err != nil {
 		return InvokeResult{}, retryable("audit-unavailable", "%v", err)

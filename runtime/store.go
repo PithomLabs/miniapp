@@ -129,18 +129,79 @@ func (s *invocations) getByRun(ctx context.Context, tenantID, runID string) (inv
 	})
 }
 
-func (s *invocations) update(ctx context.Context, tenantID, id string, status contract.RunStatus, result json.RawMessage, runID, errMsg string) error {
+// Predicated invocation transitions (M-01). Each reports whether it
+// won (affected exactly one row); losers reload and route on fresh
+// state instead of overwriting. Quarantined is absent from every
+// predicate: operator-triage records exit only via resume/fail
+// (CR-05 invariant), never via completion, settle, sync, or agent
+// cancel.
+
+// completeIfLive records a synchronous completion from a live,
+// unclaimed-by-cancellation state: pending (undispatched Class A),
+// running, or waiting_approval (granted Class A awaiting inline
+// execution). A concurrent Cancel wins over the completion.
+func (s *invocations) completeIfLive(ctx context.Context, tenantID, id string, status contract.RunStatus, result json.RawMessage, errMsg string) (bool, error) {
 	resultArg := ""
 	if len(result) > 0 {
 		resultArg = string(result)
 	}
-	_, err := store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
-		_, err := tx.Exec(ctx, `UPDATE app.invocations SET status = $1,
-			result = NULLIF($2, '')::jsonb, run_id = $3, error = $4, updated_at = now()
-			WHERE id = $5::uuid AND tenant_id = $6`, string(status), resultArg, runID, errMsg, id, tenantID)
-		return true, err
+	return store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+		tag, err := tx.Exec(ctx, `UPDATE app.invocations SET status = $1,
+			result = NULLIF($2, '')::jsonb, error = $3, updated_at = now()
+			WHERE id = $4::uuid AND tenant_id = $5
+			AND status IN ('pending','running','waiting_approval')`,
+			string(status), resultArg, errMsg, id, tenantID)
+		if err != nil {
+			return false, err
+		}
+		return tag.RowsAffected() == 1, nil
 	})
-	return err
+}
+
+// failIfWaiting records a poll settlement (denied/expired/approval-
+// cancelled) from the waiting state only.
+func (s *invocations) failIfWaiting(ctx context.Context, tenantID, id, runID, errMsg string) (bool, error) {
+	return store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+		tag, err := tx.Exec(ctx, `UPDATE app.invocations SET status = 'failed',
+			run_id = $1, error = $2, updated_at = now()
+			WHERE id = $3::uuid AND tenant_id = $4 AND status = 'waiting_approval'`,
+			runID, errMsg, id, tenantID)
+		if err != nil {
+			return false, err
+		}
+		return tag.RowsAffected() == 1, nil
+	})
+}
+
+// syncIfLive records an executor-observed status, but only from a
+// live state: a stale sync observation can never overwrite a
+// terminal record (notably cancellation).
+func (s *invocations) syncIfLive(ctx context.Context, tenantID, id string, live contract.RunStatus) (bool, error) {
+	return store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+		tag, err := tx.Exec(ctx, `UPDATE app.invocations SET status = $1, updated_at = now()
+			WHERE id = $2::uuid AND tenant_id = $3
+			AND status IN ('running','waiting_event','waiting_approval')`,
+			string(live), id, tenantID)
+		if err != nil {
+			return false, err
+		}
+		return tag.RowsAffected() == 1, nil
+	})
+}
+
+// cancelIfLive records a cancellation from a live state only.
+func (s *invocations) cancelIfLive(ctx context.Context, tenantID, id, runID, reason string) (bool, error) {
+	return store.WithTenant(ctx, s.pool, tenantID, func(tx pgx.Tx) (bool, error) {
+		tag, err := tx.Exec(ctx, `UPDATE app.invocations SET status = 'cancelled',
+			run_id = $1, error = $2, updated_at = now()
+			WHERE id = $3::uuid AND tenant_id = $4
+			AND status IN ('running','waiting_event','waiting_approval')`,
+			runID, reason, id, tenantID)
+		if err != nil {
+			return false, err
+		}
+		return tag.RowsAffected() == 1, nil
+	})
 }
 
 // parkTx transitions one invocation to waiting_approval inside the

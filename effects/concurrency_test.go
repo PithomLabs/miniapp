@@ -320,7 +320,7 @@ func TestKillMidSendAdoptsUnknown(t *testing.T) {
 	mockcap.EnsureLog(t, db.Pool)
 	mockcap.TruncateLog(t, db.Pool)
 	op := "op-kill"
-	cmd := testkit.SpawnWorker(t, "TestEffectsCrashWorker", map[string]string{
+	w := testkit.SpawnWorker(t, "TestEffectsCrashWorker", map[string]string{
 		workerEnvKey: "1", "MINIAPP_EFFECTS_OP": op,
 	})
 	deadline := time.Now().Add(60 * time.Second)
@@ -335,12 +335,12 @@ func TestKillMidSendAdoptsUnknown(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			testkit.Kill9(t, cmd)
+			testkit.Kill9(t, w)
 			t.Fatal("worker never reached provider acceptance")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	testkit.Kill9(t, cmd)
+	testkit.Kill9(t, w)
 
 	var sends int
 	svc := effects.New(effects.Config{Pool: db.Pool, Channels: map[string]effects.Channel{
