@@ -329,7 +329,9 @@ func TestKillMidSendAdoptsUnknown(t *testing.T) {
 	mockcap.TruncateLog(t, db.Pool)
 	op := "op-kill"
 	seedLiveInvocation(t, db, wsTenant, "inv-kill")
-	w := testkit.SpawnWorker(t, "TestEffectsCrashWorker", map[string]string{
+	// Anchored: -test.run is a regex and sibling worker
+	// entrypoints now exist; run exactly this one.
+	w := testkit.SpawnWorker(t, "TestEffectsCrashWorker$", map[string]string{
 		workerEnvKey: "1", "MINIAPP_EFFECTS_OP": op,
 	})
 	deadline := time.Now().Add(60 * time.Second)
@@ -349,6 +351,9 @@ func TestKillMidSendAdoptsUnknown(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	epochBefore := ""
+	_ = db.Pool.QueryRow(context.Background(), `SELECT attempt_id FROM app.effect_records
+		WHERE business_op_id = $1`, wsTenant+":"+op).Scan(&epochBefore)
 	testkit.Kill9(t, w)
 
 	var sends int
@@ -382,5 +387,13 @@ func TestKillMidSendAdoptsUnknown(t *testing.T) {
 	}
 	if n := mockcap.SentCount(t, db.Pool, op); n != 1 {
 		t.Fatalf("provider sends = %d, want exactly 1", n)
+	}
+	epochAfter := ""
+	if err := db.Pool.QueryRow(context.Background(), `SELECT attempt_id FROM app.effect_records
+		WHERE business_op_id = $1`, wsTenant+":"+op).Scan(&epochAfter); err != nil {
+		t.Fatal(err)
+	}
+	if epochAfter != epochBefore || epochAfter == "" {
+		t.Fatalf("epoch = %q, want retained %q (quarantine keeps the dead epoch)", epochAfter, epochBefore)
 	}
 }

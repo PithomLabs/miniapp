@@ -65,7 +65,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/signal", s.handleSignal)
 	mux.HandleFunc("POST /v1/cancel", s.handleCancel)
 	mux.HandleFunc("POST /v1/decide", s.handleDecide)
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	return mux
+}
+
+// handleHealthz reports liveness plus the grant-configuration
+// hash for revocation verification. Unauthenticated by design
+// (design §6): the hash is credential-free and reveals nothing
+// about grants, keys, or authorities. Shape: {"status":"ok",
+// "grant_config_hash":"sha256:..."}.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "grant_config_hash": s.svc.GrantConfigHash()})
 }
 
 func credential(r *http.Request) string {

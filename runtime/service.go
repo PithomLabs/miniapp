@@ -91,6 +91,14 @@ func New(cfg Config) (*Service, error) {
 	return &Service{cfg: cfg, store: &invocations{pool: cfg.Pool}, validator: newValidator()}, nil
 }
 
+// GrantConfigHash returns the credential-free grant-configuration
+// hash for health reporting and revocation verification. The hash
+// itself pins the snapshot under RLock; callers must not hold
+// policy locks across the call.
+func (s *Service) GrantConfigHash() string {
+	return s.cfg.Policy.ConfigHash()
+}
+
 // IntentHash delegates to the shared contract implementation
 // (single definition; this wrapper preserves existing call sites,
 // including frozen regression tests).

@@ -5,7 +5,9 @@
 # no credential values. See docs/development/local-postgres.md.
 #
 # Required environment (exported by Taskfile.dev.yml tasks):
-#   POSTGRES_IMAGE       Official image tag (default postgres:19.0).
+#   POSTGRES_IMAGE       Official image (default: digest-pinned
+#                        postgres@sha256:bb6e70ad...; override with care —
+#                        evidence requires the pinned PG19 digest).
 #   POSTGRES_MAJOR       Major version matching the image (default 19).
 #   POSTGRES_USER        Role name (default miniapp).
 #   POSTGRES_DB          Database name (default miniapp_dev).
@@ -14,7 +16,7 @@ name: miniapp-dev
 
 services:
   db:
-    image: ${POSTGRES_IMAGE:-postgres:19.0}
+    image: ${POSTGRES_IMAGE:-postgres@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60}
     restart: unless-stopped
     networks:
       - miniapp-dev

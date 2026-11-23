@@ -92,3 +92,39 @@ default verified in `dbos-transact-golang@v1.9.0` source.
   sleeper envelope evidence), and no Enterprise module may be
   imported without explicit owner approval (`scripts/checks.sh`
   gate 3).
+
+## Grant revocation (rollout, window, rollback, verification)
+
+Grants are process-local snapshots loaded at startup; there is
+no hot-reload. Revocation is a deployment procedure with a
+bounded staleness window — never an instant global effect.
+
+- Routing/drain: roll replicas one at a time. In-flight
+  transactions complete under their start-of-transaction
+  grants; new authorizations on a restarted replica use the
+  new snapshot immediately.
+- Command: `miniapp auth verify-revocation <expected-hash>
+  [--replicas host,...] [--replicas-file f] [--timeout 5s]`.
+  Inventory is explicit operator input only (no discovery).
+  Each replica's `/healthz` is polled with timeout; the
+  command exits 0 iff every listed replica reports the
+  expected hash, nonzero otherwise, and never succeeds on
+  an empty or unreachable inventory.
+- Expected hash source: copy `grant_config_hash` from the
+  replica's startup log line or its live `/healthz`
+  response before running the command; never guess it.
+- Window: ten minutes maximum staleness. A rolling restart
+  exceeding it is a deployment failure: investigate the
+  stuck replica, do not widen the window.
+- Rollback: restore the previous grants file and restart;
+  rollback preserves restrictive grants (re-adding access
+  requires the same rollout discipline in reverse).
+- Verification procedure: after rollout, run
+  verify-revocation against the full replica inventory and
+  confirm `revocation verified`. `STALE` means restart the
+  replica; `MISMATCHED` means a partial rollout or drift;
+  `INCOMPLETE` means unreachable replicas — the fleet is
+  unverified until every entry answers.
+- Honest claims only: revocation takes effect "on the next
+  authorization by a replica holding current config". Never
+  promise immediate global revocation.

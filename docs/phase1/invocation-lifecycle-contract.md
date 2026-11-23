@@ -500,6 +500,39 @@ capability set. Mock-only operation is unaffected;
 real-provider admission is refused until this membership
 check lands with its tests.
 
+P26-002 activation trigger (bounded residual): before any
+empty-mode production manifest enables gated tools,
+submit-side validation must prevent admission of trust
+combinations that cannot pass the authorization boundary.
+Empty modes retain legacy unrestricted admission but do not
+grant the explicit autonomous linkage exception, so
+gated+autonomous submits admit and then refuse
+`approval-missing` (pinned by
+`TestP27EmptyModeGatedAutonomousRefused`). Preferred durable
+direction: explicit trust-mode declaration for gated tools,
+or an equivalent manifest-admission rule preserving legacy
+behavior outside that boundary.
+
+C6 operation-ID rule (normative): miniapps derive
+BusinessOpID from stable business identity
+(`tenant-id ":" business-key`) — never from invocation,
+run, or attempt IDs. The same business operation across
+retries (same or new idempotency key) MUST reuse the
+identical BusinessOpID; adoption, reconciliation, and
+deduplication depend on it. Attempt epochs are
+framework-minted per attempt (P24-007); miniapps must
+not mint, supply, or reuse attempt IDs. A Class A
+handler that receives ErrAttemptInProgress MUST return
+it promptly without waiting or retrying in-handler; the
+framework rolls the attempt back and reports contention,
+and the caller retries per the documented
+same-key/new-key semantics (pinned end to end by
+`TestP28C6ClassARecovery`). Abandoned-PENDING boundary: a
+new BusinessOpID can never adopt a pending effect bound to
+another invocation — see `docs/development/effect-authoring.md`
+("Abandoned-PENDING boundary"), analyzed-only per Prompt29,
+no execution claim.
+
 ### M4 — Workflow / run identity (`executor/dbos` + store)
 
 | Event | Source | Dest | Predicate / lock | Atomicity | Auth | Audit | Failure exit → recovery | Test |
@@ -951,11 +984,13 @@ disposition — a matrix update alone is not sufficient.
   re-seed; old invocations are terminal and never re-attempted).
   Standing rule: any future encoding change with production data
   present requires dual-read or backfill before cutover.
-- **Operator `settle` verb (F-03 Settle disposition, doc-spec only —
-  P2 implements):** `miniapp settle --op <business-op-id> --to
+- **Operator `settle` verb (F-03 Settle disposition —
+  implemented in P28.1 via `runtime.Service.SettleEffect` +
+  `settle` verb):** `miniapp settle --op <business-op-id> --to
   <confirmed|failed|not-applied> --note <evidence>`; authenticates
-  the operator via canonical API keys; invokes the predicated
-  `UNKNOWN→RECONCILING→terminal` pair (§7/M3) over the normal
+  the operator via canonical API keys; invokes the atomic
+  predicated `UNKNOWN→terminal` transition with same-transaction
+  audit (§7/M3) over the normal
   runtime connection (effect tables are app-writable; no control
   DSN needed); refuses non-`UNKNOWN` rows; writes the
   `effect-settled/<outcome>` audit with the evidence note. A
@@ -1082,6 +1117,8 @@ source file was modified; only this document and evidence changed.
 | P20 MEDIUM-3 | prompt17:144 + plan-review mirror corrected: §4 authoritative, advisory-last struck, authorizeAttempt takes no advisory lock, outermost-first preserved | Binding work order contradicted corrected §4 (deadlock-prone direction + inapplicable lock) | prompt17.md, prompt17_plan_review.md | repo-wide grep: no advisory-last instructions remain in governing docs (historical reviews/writeups describing the contradiction preserved as records, listed in evidence) | none |
 | P22 P21-002 | Pending semantics fixed structurally: adoption marks pending→running atomically; pending ⟹ unsubmitted, so checkLive/cancelIfLive/syncIfLive keep excluding pending and authorizeAttempt treats pending as ineligible | Specified stuck state (pending+workflow) proven unreachable — approval gate refuses pre-linkage submits, park atomicity couples approval to waiting — but the invariant was argument-only | §4.2, CR-05/INFO-1 (+checkLive listed) | adoption-flip red/green + 4 fail-closed characterization suites + full-suite regressions | none; Class A pending (never adopts) untouched by construction |
 | P25 Gate-1 corrections | P24-001 commit-on-decision withdrawal with same-tx paired audit; P24-002 attempt-fenced outcome transitions; P24-003 lock-free Settle attribution (§4.2 "5 only" now true); P24-005 option (a) autonomous exception + independent trust-modes admission; P24-004 M5 probe-scoped deferral + enforceable activation trigger; P24-007 claim-time framework minting; P24-008 capability-membership prerequisite; P24-009 AST policy guard; P24-010 state-qualified contention hint; P24-011 phantom-binding terminal taxonomy | Gate 1 review (adv_review_prompt24) found 2 HIGH + 1 lock-order + 2 dispositions + 6 LOW/INFO against the Stage 3A authorization core | §4.2 Settle row, §7/M3 Authorize/Withdraw/Send rows, §7/M5, §7/M3 P24-008 prerequisite, §16 | `TestP25POC1*`, `TestP25TerminalWithdraw*`, `TestP25POC2*`, `TestP25Settle*`, `TestP25M1–M7`, `TestP25Mint*`, `TestP25Contention*`, `TestP25NoRows*`, `TestP23GuardNegativeControl` (all red/green or guard-pinned per finding) | empty-TrustModes manifests keep legacy demand-linkage (declare modes for coherence); mint-failure branch defensive (unforceable); pure map aliasing beyond the AST guard (documented) |
+| P26-001 (Prompt27) | Owner confirms the scoped P24-005 reading: the hostile-approval anti-bypass rule applies ONLY when persisted trust is Confirm (anti-spoofing; callers cannot flip Confirm to Autonomous); genuinely persisted Autonomous + explicit manifest permission proceeds without linkage, and inapplicable approval rows create no requirement | Agent plan/review sentence ("any present hostile approval") broadened the twice-scoped owner rule without authority; data model verified (approvals attach only via non-autonomous park paths, adv_review_prompt26 §6) | design §2 approval row, §7/M3 Authorize row (unchanged text; scope cited here) | `TestP25M6` (confirm legs + autonomous-exception leg; disposition cited on the leg) | none — closed, no code change |
+| P28.1 Settle operator wiring | Owner Option A: exact `miniapp.settle.operator` role on the authenticated binding; new `runtime.Service.SettleEffect` shared boundary (derived tenant/operator, validated outcome/note, atomic delegated Settle, non-oracle unknown-effect mapping) + `settle` CLI verb; F-03 bullet corrected to atomic Settle | WS-E wiring was stopped for lack of a trusted authority; closes OSI-2 for this role only (broader identity architecture still open) | §12 F-03 bullet, §16 | `TestP281SettleOp*` matrix (authorized/refusals/isolation/validation), `TestP281SettleVerb*` (flags + E2E) | demo API-key provisioning is not production identity (prompt28.1 §4); CLI credential process-listing exposure carried to the future Security Contract |
 
 No new architectural conflicts discovered. No owner decision
 invented. OpenCode remains NOT RUN/BLOCKED (unchanged, non-blocking).

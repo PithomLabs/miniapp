@@ -326,25 +326,23 @@ characterization legs are labeled as such.
 
 ## 11. C1–C7 compliance updates
 
-- C1 (no advisory in authorize): preserved — no new
-  advisory SQL (`transition` predicate, withdraw,
-  mint, mappings are plain DML).
-- C2 (global lock order): P24-003 restores it —
-  Settle is now effect-lock-only (proof in §5);
-  authorize order RLock → 1 → 2 → 4 → 5 unchanged
-  (trust checks use held row + in-memory manifest,
-  no new locks).
-- C3–C4 (tx atomicity, grant snapshot): P24-001
-  extends atomicity to withdrawal+audit; grant
-  snapshot untouched.
-- C5 (fencing/leases): P24-002 adds attempt-epoch
-  fencing; P24-007 makes epochs framework-minted.
-- C6 (retry semantics): P24-010 corrects the
-  contention instruction; P24-001 repeats refuse
-  without resurrection.
-- C7 (terminal authority): P24-001 withdrawal +
-  P24-011 phantom taxonomy tighten terminal handling;
-  no authorization path weakened.
+CORRECTED per P26-003 (Prompt27): this section previously
+relabeled C3–C7 against the Prompt21 definitions. The table
+below restores the original meanings with accurate Gate 1
+status (authoritative mapping: Prompt26 review §7). No
+constraint regressed; in particular, C6 remains
+mechanism-sound but integration-unproven — P24-010
+corrected contention guidance only and did not close it.
+
+| Constraint (P21 definition) | Gate 1 status | Evidence |
+|---|---|---|
+| C1 — `authorizeAttempt` takes no advisory lock | Holds | Statement-level re-read: plain DML only; no new advisory SQL |
+| C2 — Authorization follows the global lock order | Holds; P24-003 restored Settle's effect-lock-only footprint | Lock-free attribution; schema audit; discriminating test |
+| C3 — Authorization uses its own transaction, not the attempt's `pgx.Tx` | Holds | Signature unchanged; WithTenant checkout; callers pass no tx |
+| C4 — No new advisory-lock acquirers | Holds | Exhaustive grep; INFO-2 + AST guards green |
+| C5 — Explicit pending semantics | Holds | P21-002 flip intact; authorize treats pending ineligible |
+| C6 — Class A handlers that call `Perform` handle `ErrAttemptInProgress` with bounded recovery and correct operation-ID behavior | Mechanism sound; integration unproven; fixture and guidance deferred | Contention path intact; fixture + op-ID guidance still outstanding — explicitly NOT closed by P24-010 |
+| C7 — O-01 orphan window closes at the effect boundary | Holds; strengthened by P24-001 | Terminal refuses + now actually withdraws; orphan cannot send and now terminalizes |
 
 ## 12. Remaining Stage 3A work (NOT started)
 

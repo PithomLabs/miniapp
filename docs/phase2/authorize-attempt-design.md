@@ -409,6 +409,19 @@ tool's declared capability set. Mock-only operation is
 unaffected; real-provider admission is refused until this
 membership check lands with its tests.
 
+Activation trigger (P26-002 — bounded residual): before any
+empty-mode production manifest enables gated tools,
+submit-side validation must prevent admission of trust
+combinations that cannot pass the authorization boundary
+(empty modes neither admit-restrict nor grant the explicit
+autonomous exception, so gated+autonomous submits admit and
+then refuse `approval-missing` — pinned by
+`TestP27EmptyModeGatedAutonomousRefused`). Preferred durable
+direction: explicit trust-mode declaration for gated tools,
+or an equivalent manifest-admission rule that preserves
+existing legacy behavior outside that boundary. No broad
+manifest migration in this task.
+
 Stages 3–5 proceed only on owner release of this design.
 
 ## 12. Owner conditions (Stage 3A release; binding)

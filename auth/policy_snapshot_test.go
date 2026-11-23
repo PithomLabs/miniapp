@@ -113,3 +113,36 @@ func TestP23ConcurrentSnapshotAccess(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// TestP28ConfigHashOrderInvariant proves map-order invariance
+// deterministically: rotated insertion orders across separate
+// policies plus repeated reads (Go map iteration is random per
+// read) must all agree bit-for-bit.
+func TestP28ConfigHashOrderInvariant(t *testing.T) {
+	build := func(order []string) map[string]map[string]contract.TrustMode {
+		g := map[string]map[string]contract.TrustMode{}
+		for _, tenant := range order {
+			g[tenant] = map[string]contract.TrustMode{}
+		}
+		modes := map[string]contract.TrustMode{"a": contract.TrustAutonomous, "b": contract.TrustConfirm, "c": contract.TrustDryRun}
+		for _, tenant := range order {
+			for m, mode := range modes {
+				g[tenant]["m-"+m] = mode
+			}
+		}
+		return g
+	}
+	want := NewPolicy(nil, build([]string{"t1", "t2", "t3"})).ConfigHash()
+	rots := [][]string{{"t2", "t3", "t1"}, {"t3", "t1", "t2"}, {"t1", "t3", "t2"}}
+	for _, r := range rots {
+		if got := NewPolicy(nil, build(r)).ConfigHash(); got != want {
+			t.Fatalf("rotated-insertion hash = %q, want %q", got, want)
+		}
+	}
+	p := NewPolicy(nil, build([]string{"t1", "t2", "t3"}))
+	for i := 0; i < 100; i++ {
+		if got := p.ConfigHash(); got != want {
+			t.Fatalf("read %d hash = %q, want %q (iteration order leaked)", i, got, want)
+		}
+	}
+}

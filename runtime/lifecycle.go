@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -218,6 +219,68 @@ func opIDs(recs []contract.EffectRecord) []string {
 // signal is a redeliverable notification — Decide is idempotent, so
 // a decider that crashes after commit retries to completion, and the
 // workflow re-reads the authoritative table on wake.
+// settleOperatorRole is the canonical Settle operator authority
+// (owner decision prompt28.1, Option A — closes OSI-2 for this
+// role only). It is deliberately unexported and checked in
+// exactly one place: this is a single-purpose gate, not a
+// generic RBAC vocabulary.
+const settleOperatorRole = "miniapp.settle.operator"
+
+// hasSettleRole reports whether the authenticated binding
+// carries the operator role. Exact, case-sensitive match;
+// no caller input participates.
+func hasSettleRole(binding auth.Binding) bool {
+	for _, role := range binding.Roles {
+		if role == settleOperatorRole {
+			return true
+		}
+	}
+	return false
+}
+
+// SettleEffect is the single shared authorization boundary for
+// operator settlement (prompt28.1). Every present and future
+// adapter (CLI, API, MCP, internal service) must enter here;
+// no adapter may implement its own operator check.
+//
+// It authenticates the credential, requires the exact operator
+// role, derives tenant and operator identity solely from the
+// server-resolved binding, validates outcome and evidence
+// note, and delegates to the atomic effects.Settle. Tenant
+// isolation is enforced by the authoritative predicated
+// operation itself — there is no separate existence lookup,
+// so no race and no existence oracle: missing and foreign
+// effects fail identically with terminal unknown-effect.
+func (s *Service) SettleEffect(ctx context.Context, credential, opID string, outcome contract.EffectState, note string) (contract.EffectRecord, error) {
+	binding, err := s.cfg.Policy.Authenticate(credential)
+	if err != nil {
+		return contract.EffectRecord{}, terminal("auth-required", "authentication failed")
+	}
+	if !hasSettleRole(binding) {
+		return contract.EffectRecord{}, terminal("forbidden", "operator authority required")
+	}
+	tenantID := binding.Authority.TenantID
+	if binding.AgentID == "" || tenantID == "" {
+		return contract.EffectRecord{}, terminal("forbidden", "operator authority required")
+	}
+	switch outcome {
+	case contract.EffectConfirmed, contract.EffectFailed, contract.EffectNotApplied:
+	default:
+		return contract.EffectRecord{}, terminal("invalid-request", "outcome must be confirmed, failed, or not-applied")
+	}
+	if strings.TrimSpace(note) == "" {
+		return contract.EffectRecord{}, terminal("invalid-request", "evidence note is required")
+	}
+	rec, err := s.cfg.Effects.Settle(ctx, tenantID, opID, outcome, note, binding.AgentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return contract.EffectRecord{}, terminal("unknown-effect", "no such effect")
+		}
+		return contract.EffectRecord{}, err
+	}
+	return rec, nil
+}
+
 func (s *Service) DecideApproval(ctx context.Context, credential, approvalID string, decision contract.ApprovalDecision, intentHash contract.Digest) error {
 	binding, err := s.cfg.Policy.Authenticate(credential)
 	if err != nil {

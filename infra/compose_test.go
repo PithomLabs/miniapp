@@ -59,8 +59,8 @@ func TestComposeBaseHasNoPublishedPorts(t *testing.T) {
 	if strings.Contains(out, "ports:") {
 		t.Error("base compose.yaml must not publish ports")
 	}
-	if !strings.Contains(out, "image: postgres:19.0") {
-		t.Error("base compose must use the resolved postgres:19.0 default")
+	if !strings.Contains(out, "image: postgres@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60") {
+		t.Error("base compose must use the digest-pinned PG19 default (no floating tag)")
 	}
 	if !strings.Contains(out, "miniapp-pgdata-19") {
 		t.Error("base compose must use the major-isolated volume name")

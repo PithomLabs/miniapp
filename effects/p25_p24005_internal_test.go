@@ -323,6 +323,10 @@ func TestP25M5PersistedTrustDecides(t *testing.T) {
 // linkage exception (mirrors the submit choke, which never loads
 // linkage for autonomous trust) — discriminating, since pre-fix
 // code evaluates the present denial and refuses.
+// Owner scope confirmed (P26-001, Prompt27; contract §16):
+// the anti-bypass rule binds persisted-Confirm invocations
+// (anti-spoofing); inapplicable rows create no requirement
+// for genuinely persisted-Autonomous invocations.
 func TestP25M6HostileApprovalsEvaluated(t *testing.T) {
 	cases := []struct {
 		name        string

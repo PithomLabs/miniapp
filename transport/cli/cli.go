@@ -14,6 +14,10 @@ import (
 
 // CredentialEnv carries the default credential when --credential is
 // absent, so secrets never appear in process arguments.
+// Limitation (carried to the future Security Contract): a
+// credential passed via --credential IS visible in process
+// listings; prefer the env var, and treat CLI-passed
+// credentials as demo-grade handling, never secure storage.
 const CredentialEnv = "MINIAPP_CREDENTIAL"
 
 // Runner executes CLI commands against one canonical service.
@@ -41,7 +45,7 @@ func (r *Runner) errOut() io.Writer {
 // 0 on success, 2 on flag misuse, 1 on service failure.
 func (r *Runner) Run(ctx context.Context, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(r.errOut(), "usage: miniapp <invoke|status|signal|cancel|decide> [flags]")
+		fmt.Fprintln(r.errOut(), "usage: miniapp <invoke|status|signal|cancel|decide|settle> [flags]")
 		return 2
 	}
 	var err error
@@ -56,6 +60,8 @@ func (r *Runner) Run(ctx context.Context, args []string) int {
 		err = r.cancel(ctx, args[1:])
 	case "decide":
 		err = r.decide(ctx, args[1:])
+	case "settle":
+		err = r.settle(ctx, args[1:])
 	default:
 		fmt.Fprintf(r.errOut(), "unknown command %q\n", args[0])
 		return 2
@@ -189,5 +195,39 @@ func (r *Runner) decide(ctx context.Context, args []string) error {
 		return err
 	}
 	r.print(map[string]string{"status": "decided"})
+	return nil
+}
+
+func (r *Runner) settle(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("settle", flag.ContinueOnError)
+	fs.SetOutput(r.errOut())
+	op := fs.String("op", "", "business operation ID (required)")
+	to := fs.String("to", "", "confirmed, failed, or not-applied (required)")
+	note := fs.String("note", "", "evidence note (required)")
+	cred, ok := r.credential(fs, args)
+	if !ok {
+		return fmt.Errorf("flag error")
+	}
+	if *op == "" || *to == "" || *note == "" {
+		return fmt.Errorf("op, to, and note are required")
+	}
+	var outcome contract.EffectState
+	switch *to {
+	case "confirmed":
+		outcome = contract.EffectConfirmed
+	case "failed":
+		outcome = contract.EffectFailed
+	case "not-applied":
+		outcome = contract.EffectNotApplied
+	default:
+		return fmt.Errorf("to must be confirmed, failed, or not-applied")
+	}
+	// No authorization logic here: the service method is the
+	// single shared enforcement boundary.
+	rec, err := r.Svc.SettleEffect(ctx, cred, *op, outcome, *note)
+	if err != nil {
+		return err
+	}
+	r.print(rec)
 	return nil
 }

@@ -65,8 +65,10 @@ func main() {
 		err = serveMCP()
 	case "migrate":
 		err = migrateUp()
-	case "invoke", "status", "signal", "cancel", "decide":
+	case "invoke", "status", "signal", "cancel", "decide", "settle":
 		err = runDirect(os.Args[1:])
+	case "auth":
+		err = runAuth(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -78,7 +80,23 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: miniapp <serve-rest|serve-mcp|migrate|invoke|status|signal|cancel|decide> ...")
+	fmt.Fprintln(os.Stderr, "usage: miniapp <serve-rest|serve-mcp|migrate|invoke|status|signal|cancel|decide|settle|auth> ...")
+}
+
+// runAuth dispatches service-free operator commands. Unlike the
+// direct verbs, these need no database, keys file, or service:
+// verify-revocation polls replica health endpoints over HTTP.
+func runAuth(args []string) error {
+	if len(args) == 0 || args[0] != "verify-revocation" {
+		fmt.Fprintln(os.Stderr, "usage: miniapp auth verify-revocation <expected-hash> [--replicas h,...] [--replicas-file f]")
+		os.Exit(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if code := cli.VerifyRevocation(ctx, os.Stdout, os.Stderr, args[1:]); code != 0 {
+		return fmt.Errorf("command failed (exit %d)", code)
+	}
+	return nil
 }
 
 type wired struct {
@@ -219,7 +237,7 @@ func serveRest() error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	logger.Info("rest serving", "addr", srv.Addr)
+	logger.Info("rest serving", "addr", srv.Addr, "grant_config_hash", w.svc.GrantConfigHash())
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		return err
 	}

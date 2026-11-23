@@ -627,12 +627,19 @@ func (s *Service) Settle(ctx context.Context, tenantID, opID string, outcome con
 		}
 		if cur.State != contract.EffectUnknown {
 			if cur.State == outcome && cur.ProviderReply == note {
-				// Idempotent repeat: backfill a missing audit,
-				// then succeed without touching the row.
-				if err := s.backfillSettleAudit(ctx, tx, tenantID, cur, outcome, note, operator); err != nil {
+				// Idempotent repeat: re-read FOR UPDATE so
+				// concurrent repeats serialize on the effect
+				// row (lock 5, same as the settle path) and
+				// backfill at most once; then succeed without
+				// touching the row.
+				locked, err := s.loadTxLocked(ctx, tx, tenantID, opID)
+				if err != nil {
 					return false, err
 				}
-				settled = cur
+				if err := s.backfillSettleAudit(ctx, tx, tenantID, locked, outcome, note, operator); err != nil {
+					return false, err
+				}
+				settled = locked
 				return true, nil
 			}
 			if cur.State == contract.EffectPending || cur.State == contract.EffectAttempting {

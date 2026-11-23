@@ -4,7 +4,7 @@
 version: '3'
 
 vars:
-  POSTGRES_IMAGE: '{{.POSTGRES_IMAGE | default "postgres:19.0"}}'
+  POSTGRES_IMAGE: '{{.POSTGRES_IMAGE | default "postgres@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60"}}'
   POSTGRES_MAJOR: '{{.POSTGRES_MAJOR | default "19"}}'
   POSTGRES_USER: '{{.POSTGRES_USER | default "miniapp"}}'
   POSTGRES_DB: '{{.POSTGRES_DB | default "miniapp_dev"}}'
